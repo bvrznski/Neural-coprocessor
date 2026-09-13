@@ -282,16 +282,26 @@ see, and all of them need a restart.
 
         Depth=1 needs mgpu_depth_tap.fx. MVec=0 turns motion vectors off.
 
-    SRUpscale=1    DLSS Super Resolution on the second card.
+    SRUpscale=0    DLSS Super Resolution on the second card. OFF by default.
     SRQuality=2    2 quality, 1 balanced, 0 performance.
     SRScale=67     The resolution neural rendering runs at, percent per axis.
                    The panel's modes write this: quality 67, balanced 58,
-                   performance 50.
+                   performance 50. Only does anything with SRUpscale=1.
 
-        The second card does its neural work at a smaller resolution and lets
-        DLSS scale the result back up, which makes that work a lot cheaper.
-        This is its own setting and does not depend on the game's DLSS, which
-        can be set to anything, or turned off entirely.
+        With this off, neural rendering runs at the full display resolution,
+        which is the better picture and the more expensive one.
+
+        Turn it on and the second card does its neural work at a smaller
+        resolution and lets DLSS scale the result back up, which makes that
+        work a lot cheaper - worth it if the second card is the weaker of the
+        two, or the one struggling. This is its own setting and does not
+        depend on the game's DLSS, which can be set to anything, or turned off
+        entirely.
+
+        EXPERIMENTAL, and newer than the rest of the bridge. Turn it on in the
+        add-on's panel in the ReShade overlay rather than editing SRScale by
+        hand: the panel writes the scale and the motion-vector flag together,
+        and those two are one setting.
 
     Frames=0       Run until the game closes. Set a number (60..100000) for a
                    bounded run that ends with a summary.
