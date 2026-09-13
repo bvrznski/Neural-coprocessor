@@ -816,18 +816,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextUnformatted("upscaling");
             if (ImGui::RadioButton("Native Upscaling", m_match))
             { m_match = true;  write_mode(m_mode); }
-            ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
-            ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
-            ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
-            ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
+            ImGui::TextDisabled("Upscales from the game's own render resolution.");
 
-            if (ImGui::RadioButton("Experimental Upscaling", !m_match))
+            if (ImGui::RadioButton("Experimental Upscaler", !m_match))
             { m_match = false; write_mode(m_mode); }
-            ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
-            ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
-            ImGui::TextDisabled("works on a title that is not upscaling at all.");
-            ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
-            ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
+            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
+            ImGui::TextDisabled("cost in quality. Untested.");
 
             // Greyed rather than hidden, for the same reason as the block
             // above: all three write SRScale, Native Upscaling overrides it,
@@ -1224,18 +1218,12 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextUnformatted("upscaling");
             if (ImGui::RadioButton("Native Upscaling##su", want_match))
             { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
-            ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
-            ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
-            ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
-            ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
+            ImGui::TextDisabled("Upscales from the game's own render resolution.");
 
-            if (ImGui::RadioButton("Experimental Upscaling##su", !want_match))
+            if (ImGui::RadioButton("Experimental Upscaler##su", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
-            ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
-            ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
-            ImGui::TextDisabled("works on a title that is not upscaling at all.");
-            ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
-            ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
+            ImGui::TextDisabled("Works from a downscaled resolution. More performance, possible");
+            ImGui::TextDisabled("cost in quality. Untested.");
 
             ImGui::BeginDisabled(want_match);
             ImGui::TextUnformatted("mode  ");
