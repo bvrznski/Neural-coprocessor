@@ -155,9 +155,11 @@ WHAT THE FOLDER SHOULD LOOK LIKE WHEN YOU ARE DONE
         reshade-shaders\Shaders\
             mgpu_depth_tap.fx             <- from this download
 
-The folder called mgpu is one you create. Any name works - the add-on looks in
-mgpu first and then in any subfolder beside it - but mgpu is the documented one
-and it is what the log and the panel refer to.
+CREATE A FOLDER CALLED mgpu BESIDE THE GAME EXECUTABLE, AND PUT YOUR
+nvngx_dlssnr.dll INSIDE IT. It does not exist until you make it, nothing in this
+download creates it, and the name has to be exactly mgpu - that is what the log
+and the panel refer to. Do not leave a copy beside the executable; the panel says
+INSTALL PROBLEM if it finds one.
 
 mgpu_depth_tap.fx goes wherever your ReShade shaders live. That is usually
 reshade-shaders\Shaders\ in the game folder; if your ReShade.ini points
