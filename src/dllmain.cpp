@@ -681,7 +681,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                 m_sr     = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
                 m_preset = mgpu::gpu1::ui_ini_read("SRPreset", 0);
                 m_mode   = mgpu::gpu1::ui_ini_read("SRQuality", 2);
-                m_match  = (mgpu::gpu1::ui_ini_read("SRScale", 67) == 0);
+                m_match  = (mgpu::gpu1::ui_ini_read("SRScale", 0) == 0);
             }
 
             // ---- V26: THE MODE SETS R. THE SAME LADDER THE ARMED VIEW USES ----
@@ -808,20 +808,30 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // happens otherwise: "SAY IT BEFORE THE BUTTONS, NOT AFTER... the
             // first person to use this panel clicked a preset, saw no change,
             // and reasonably concluded the control was broken."
-            if (ImGui::Checkbox("match game", &m_match))
-            {
-                // Rewrite the pair through the same path the modes use, so
-                // SRScale and SRMvLowRes can never be set independently.
-                write_mode(m_mode);
-            }
+            // Two named modes rather than a checkbox, because they are two
+            // ways of choosing R and neither is an option on the other. Both
+            // write SRScale and SRMvLowRes through write_mode, so the pair can
+            // never be set independently - the combination that crashed at arm
+            // on 2026-09-12 is unreachable from this panel.
+            ImGui::TextUnformatted("upscaling");
+            if (ImGui::RadioButton("Native Upscaling", m_match))
+            { m_match = true;  write_mode(m_mode); }
             ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
             ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
-            ImGui::TextDisabled("May reduce ghosting. Costs a little performance.");
+            ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
             ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
 
+            if (ImGui::RadioButton("Experimental Upscaling", !m_match))
+            { m_match = false; write_mode(m_mode); }
+            ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
+            ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
+            ImGui::TextDisabled("works on a title that is not upscaling at all.");
+            ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
+            ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
+
             // Greyed rather than hidden, for the same reason as the block
-            // above: all three write SRScale and match game overrides it, and
-            // a row that disappears teaches nobody it was ever an option.
+            // above: all three write SRScale, Native Upscaling overrides it,
+            // and a row that disappears teaches nobody it was ever an option.
             ImGui::BeginDisabled(m_match);
             ImGui::TextUnformatted("mode  ");
             ImGui::SameLine();
@@ -837,16 +847,14 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
             ImGui::EndDisabled();
             if (m_match)
-                ImGui::TextDisabled("Greyed: match game is on, so the game chooses the resolution.");
+                ImGui::TextDisabled("Greyed: Native Upscaling is on, so the game chooses the resolution.");
 
-            // THE NOTICE. Measured once, on one title, on one rig - and
-            // the honest version of that is not silence.
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                               "If you see ghosting or smearing in motion, turn this off.");
-            ImGui::TextDisabled("Reducing the frame and enlarging it back is newer than the");
-            ImGui::TextDisabled("rest of the bridge. It has been clean here and nobody has");
-            ImGui::TextDisabled("ruled out that it ghosts on other games or other hardware.");
+            // V28: THE OLD NOTICE IS GONE. It said "if you see ghosting or
+            // smearing in motion, turn this off", written when this section
+            // had one toggle and "this" could only mean SR. With Native and
+            // Experimental named above it, "this" no longer has one referent,
+            // and both blurbs already carry the honest framing and the ask for
+            // reports. A warning nobody can resolve to a control is noise.
 
             ImGui::EndDisabled();
 
@@ -962,25 +970,22 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                    "Mode 2 derives the flag WITHOUT correcting the scale - this is the combination that ghosted.");
         }
 
-        ImGui::SeparatorText("Reflex");
-        {
-            const char *w = (st.reflex_was < 0) ? "unknown" : (st.reflex_was ? "ON" : "OFF");
-            const char *n = (st.reflex_now < 0) ? "unknown" : (st.reflex_now ? "ON" : "OFF");
-            if (st.reflex_was < 0 && !st.reflex_applied)
-            {
-                ImGui::TextDisabled("Not engaged. Reflex=1 in mgpu.ini sets the driver's low-latency mode on GPU 0.");
-            }
-            else
-            {
-                snprintf(dl, sizeof dl, "SetSleepMode %s   |   driver reported  before %s   after %s",
-                         st.reflex_applied ? "accepted" : "REJECTED", w, n);
-                ImGui::TextUnformatted(dl);
-                ImGui::TextDisabled("The reported state is unreliable: it has read OFF after a write that plainly worked.");
-                ImGui::TextDisabled("Judge it by the GPU 0 queue above - near 1.0 is the result, not this line.");
-                if (st.reflex_was == 1)
-                    ImGui::TextDisabled("The title already had it on, so this run says nothing about the mechanism.");
-            }
-        }
+        // ---- V28: THE REFLEX READOUT IS GONE, AND IT IS NOT COMING BACK ----
+        //
+        // It printed "driver reported before X after Y" from GetSleepStatus,
+        // and that call cannot see the TITLE'S OWN Reflex. A game with Reflex
+        // enabled in its own settings produced a reading indistinguishable
+        // from one where this add-on had set it - so the line was reporting a
+        // fact it does not have access to.
+        //
+        // The panel already admitted the readout was unreliable in two
+        // TextDisabled lines beneath it. A number with a disclaimer saying not
+        // to believe it is worse than no number: it still anchors the reader,
+        // and a bug report quoting it costs a session to unpick.
+        //
+        // Reflex itself is unchanged - the key still works, it is still 0.3.0,
+        // and the GPU 0 queue figure above is the honest instrument. The
+        // ordinals and the run C result are in ledger 6l.
 
         // ---- V12: THE CONTROLS. STAGE AND COMMIT. ----
         //
