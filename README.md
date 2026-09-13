@@ -132,8 +132,6 @@ Two cables from two cards into one monitor was explored and did not reach someth
 | `CTRL+ALT+F9` / `F11` | Intensity down / up |
 | `Home` | ReShade overlay with control panel |
 
-Before the bridge arms, the panel is a settings screen: DLSS on the second card on or off, preset, and mode. Every click writes `mgpu.ini` immediately. **Restart the game for any of it to apply.**
-
 ---
 
 ## Configuration
