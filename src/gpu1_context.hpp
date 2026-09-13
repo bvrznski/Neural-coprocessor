@@ -29,6 +29,22 @@ namespace mgpu::gpu1
     // created against and must not outlive DestroyWindow (worker.cpp
     // reorders its teardown accordingly). Still a no-op for the chain
     // when none was created (the no-window path is unaffected).
+    // V32. Release the NGX features and everything under them. MUST be called
+    // before shutdown(), from the bridge thread's ordered teardown.
+    //
+    // Nothing did this before V32. stream_release() only ran on a failed arm
+    // or on a stream that reached its frame bound, so an ordinary game exit
+    // abandoned two NR feature handles, the SR feature handle, both parameter
+    // blocks and the driver snippet DLL - and then shutdown() released the
+    // device they were created against. Safe to call when nothing was ever
+    // armed; it returns silently.
+    // EXPERIMENTAL, default off. NoActivate=1 creates the bridge window
+    // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW so a click on it cannot take
+    // foreground from the game - which is what stops input, pad included.
+    bool window_no_activate();
+
+    void stream_shutdown();
+
     void shutdown();
 
     bool has_device();
@@ -293,7 +309,94 @@ struct ui_state
     bool  tuning_on = false, auto_mask = false;
     float tone_strength = 1.0f, structure_strength = 1.0f, skin_strength = 1.0f,
           style = 0.0f;
+    // P8.0: 0 = off (no DLSSNR.MVec bound - the control arm and what every
+    // published measurement ran under), 1 = a synthetic constant field.
+    int   mvec_mode = 0;
+    float mvec_dx = 0.0f, mvec_dy = 0.0f;
+    float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;
     unsigned long long consumed = 0, produced = 0, dropped = 0, overrun = 0, skipped = 0;
+    unsigned long long reordered = 0, bad_magic = 0, contract = 0;
+
+    // ---- LIVE TELEMETRY (the panel's second box) ----
+    //
+    // Every figure here is the SAME NUMBER the end-of-run log line prints, over
+    // the same divisor. That is deliberate and it is the only rule this block
+    // has: a panel that computes a mean its own way is a second instrument
+    // quietly disagreeing with the first.
+    //
+    // Rates are rolling over the panel's own draw cadence (about 0.25 s), not
+    // averages since arm - an average since arm stops responding after a minute
+    // and is useless for watching a change land.
+    double fps_produced = 0.0;   // the GAME's frame rate, from the seal counter
+    double fps_consumed = 0.0;   // what GPU 1 is actually finishing
+
+    // GPU 1's own timestamps on GPU 1's own queue. gpu1_eval_ms SPANS EVERY
+    // PASS and, when SR is up, it also contains the reduce and the upscale -
+    // it is not the neural cost on its own.
+    bool   gpu1_ts_ok = false;
+    double gpu1_copy_ms = 0.0, gpu1_unpack_ms = 0.0,
+           gpu1_eval_ms = 0.0, gpu1_out_ms = 0.0;
+
+    // lat_ready_ms is L2: from the first poll that could have known the frame
+    // existed, to the seal read. lat_submit_ms is the SEAL figure, which starts
+    // a frame earlier at copy-record time. Neither includes the game's render
+    // before them or the bridge's present after them, so NEITHER IS THE LATENCY
+    // A PLAYER FEELS end to end - they bound the bridge's own share of it.
+    double lat_ready_ms = 0.0, lat_submit_ms = 0.0;
+
+    // L1. GPU 0's queue depth at copy-record time. 1.0 is the STRUCTURAL FLOOR,
+    // not an error: the signal for frame N is issued on frame N+1's event.
+    // Around 1.0 means a working low-latency mode; 2.5+ means the game is
+    // queueing deep and that is most of the latency.
+    double             backlog_mean = 0.0;
+    unsigned long long backlog_max = 0;
+
+    unsigned           ring_depth = 0;    // slots allocated
+    unsigned           ring_window = 0;   // 0 = the window is off (the default)
+    unsigned long long ring_skipped = 0;  // skipped BY the window - NOT drops
+
+    // ---- DLSS SUPER RESOLUTION, the third box ----
+    //
+    // Read-only on purpose. Quality, preset and R are all baked into an NGX
+    // feature handle at arm time; changing one means releasing and rebuilding
+    // that handle mid-stream, which is a 200-450 ms stall on the bridge thread
+    // and a teardown path that has crashed before. Showing the state costs
+    // nothing and is most of the value; editing it is its own change.
+    bool sr_on = false;         // a handle exists and SR is in the chain
+    bool sr_requested = false;  // SRUpscale=1 but it may have declined to arm
+    unsigned sr_w = 0, sr_h = 0;        // R, what NR and SR actually run at
+    unsigned out_w = 0, out_h = 0;      // D, the display extent
+    int      sr_quality = 1;
+    int      sr_preset = 0;             // 0 = the title's default
+    unsigned sr_scale_pct = 0;          // 0 = R inherited from the game
+    unsigned sr_mv_mode = 0;            // 0 off, 1 on+corrected, 2 derive
+    bool     sr_mv_lowres = false;      // the flag as actually passed
+    float    sr_mv_fix_x = 1.0f, sr_mv_fix_y = 1.0f;
+    // V27. A rebuild staged by the panel and committed by stream_poll.
+    // sr_rebuild_last_ok: -1 none yet, 0 the last one failed, 1 it worked.
+    // ---- V28: the inner loop ("Auto") ----
+    // auto_last_mean is the measured evaluate mean over the last window, and
+    // auto_budget_ms is 1000/target. The controller compares those two and
+    // nothing else - there is no cost model in it, deliberately (ledger 6g).
+    bool     auto_on = false;
+    unsigned auto_target_fps = 60;
+    unsigned auto_rung = 0, auto_rungs = 0, auto_changes = 0;
+    double   auto_last_mean = 0.0, auto_budget_ms = 0.0;
+
+    bool     sr_rebuild_pending = false;
+    unsigned sr_rebuild_count = 0;
+    int      sr_rebuild_last_ok = -1;
+    bool     sr_snippet_requested = false;
+    bool     sr_snippet_driver = false; // which one ANSWERED
+
+    // ---- REFLEX ----
+    //
+    // reflex_now is the driver's REPORTED state and it has been measured
+    // disagreeing with reality: a SetSleepMode that returned 0 and visibly
+    // collapsed the queue still read back OFF. Show it, label it, and never
+    // draw a verdict from it - backlog_mean is the verdict.
+    int  reflex_was = -1, reflex_now = -1;   // -1 unknown, 0 off, 1 on
+    bool reflex_applied = false;             // SetSleepMode returned 0
 };
 void ui_read(ui_state &out);
 
@@ -327,6 +430,32 @@ void ui_set_tuning(bool on);
 // which: 0 tone, 1 structure, 2 skin, 3 style, 4 auto-mask (0.0/1.0).
 void ui_set_tuning_value(int which, float v);
 
+// P8.0. The motion vector field handed to DLSS-NR.
+//
+// The model keeps temporal history and reprojects it with motion vectors.
+// Every evaluate this project has run bound none, so that history is
+// misaligned on every frame the camera moves and the model re-synthesises
+// detail instead of reusing it.
+//
+// mode 0 = off, byte-identical to every published run. mode 1 binds a CONSTANT
+// field: a control in the P4.2 depth sense, two evaluates differing only in
+// whether a non-zero MVec is bound. Same output means NR does not read it here;
+// different output means it does, and only then is a flow estimator worth
+// writing.
+void ui_set_mvec_mode(int mode);
+
+// P8.1. Which passes keep DLSS-NR's temporal history.
+//   0 all passes keep it (the shipped behaviour)
+//   1 passes 2..N reset every frame - the cascade of two misaligned histories
+//     is broken and later passes become stateless refinement
+//   2 every pass resets every frame - no temporal history anywhere. If the
+//     artifact largely goes at 2, it IS the model's own misaligned history.
+void ui_set_pass_reset(int mode);
+
+// which: 0 dx, 1 dy, 2 scaleX, 3 scaleY. Sign and units are NVIDIA's
+// convention, cannot be read back, and are live for exactly that reason.
+void ui_set_mvec_value(int which, float v);
+
 // Turn the neural stage off without tearing it down - the handles stay alive so
 // it can come back without a 400 ms CreateFeature stall.
 void ui_set_neural(bool on);
@@ -341,6 +470,94 @@ void ui_set_neural(bool on);
 // nothing about the neural stage or its timing - only the copy into the
 // bridge's backbuffer.
 void ui_set_present_mode(int mode);
+
+// V27. LIVE DLSS QUALITY AND PRESET, STAGED. Pass -1 to leave a field alone.
+//
+// NOT A PLAIN SETTER, AND THE DIFFERENCE MATTERS. Both values are baked into
+// the NGX feature handle when it is created, so changing either means
+// releasing that handle and building a new one. This records the request; the
+// commit happens at the top of the next stream_poll, which is the only moment
+// on the bridge thread when GPU 1 has nothing outstanding. Calling it from the
+// overlay is therefore safe - the overlay never touches the feature itself.
+//
+// Costs one rebuild of roughly 30-40 ms, seen as a single long frame. R does
+// NOT change with either value, so nothing R-sized is rebuilt: not the
+// transport, not the ring, not the neural stage.
+//
+// quality: the NGX PerfQualityValue - 0 max perf, 1 balanced, 2 max quality,
+//          3 ultra perf, 4 ultra quality, 5 DLAA.
+// preset:  the raw NGX render-preset enum - 0 leaves the title default,
+//          11 is K, 13 is M. A DLL that does not carry the preset asked for
+//          silently uses its own; its log says which one it HONOURED, and that
+//          log is the only honest answer.
+//
+// IF THE REBUILD FAILS, SR IS OFF FOR THE REST OF THE RUN and the stream
+// continues without it - the same behaviour a failed create at arm has always
+// had. Figures from before and after a rebuild are different pipelines and
+// must not be pooled.
+// scale: R as a percentage of the display extent, or -1 to leave it. The
+// quality modes are nearly inert without it - in ordinary DLSS the mode IS how
+// the render resolution is picked, and here R came from the game instead.
+void ui_set_sr_request(int quality, int preset, int scale);
+
+// V41. The panel arms the stream, and holds AutoArm while it is open.
+//
+// Settings are read from mgpu.ini AT ARM TIME, so anything the panel writes
+// before arming takes effect in THIS session - no restart. That is what makes
+// a settings menu worth having, and it is why AutoArm must not fire while
+// somebody is still reading it.
+//
+// ui_panel_drawn() is called by the overlay every time it draws; "open" means
+// drawn within the last half second, because ReShade gives no closed event.
+// ui_request_arm() stages; the bridge loop takes it with ui_take_arm_request()
+// and calls stream_request() itself, because that is BRIDGE THREAD ONLY.
+void ui_panel_drawn();
+bool ui_panel_is_open();
+void ui_request_arm();
+bool ui_take_arm_request();
+
+// V28. Write a key into mgpu.ini and report whether it landed. THE RUNNING
+// SESSION IS UNCHANGED - every key is read at arm, so this takes effect on the
+// next launch. That is the compromise for settings that cannot be live:
+// Reflex is a driver mode engaged once on the game's first frame, and the DLAA
+// lever moves R before the feature exists. The panel edits the file and says
+// so, rather than offering a toggle that silently does nothing.
+//
+// Line-anchored like the reader: a commented-out key is a comment, not a key.
+// One line changes and the rest of the file - which is mostly documentation -
+// is preserved byte for byte. Written to a temp and renamed, because a
+// half-written mgpu.ini launches with every key at its default and no way to
+// tell (P7.2).
+bool ui_ini_write(const char *key, int value);
+
+// The FILE's current value for a key, cached after the first read so the panel
+// can call it while drawing. NOT the running session's value: after a write
+// the two disagree until the next launch, and that difference is the whole
+// point of showing it.
+int ui_ini_read(const char *key, int dflt);
+
+// ---- V46: THE INSTALL LAYOUT, AND IT IS NOT A COSMETIC WARNING ----
+//
+// nvngx_dlssnr.dll sitting beside the game executable is THE CAUSE of the
+// crash that this project spent a night on, proven 2026-09-13. The title's
+// own Streamline scans the executable's folder for nvngx_*.dll and
+// initialises what it finds, which binds NGX's cubin layer to the GAME'S
+// adapter before this add-on's thread exists - and CreateFeature on the
+// second adapter then faults inside NVIDIA's allocator and takes the process
+// with it. Cyberpunk has no use for that DLL. It loaded it because 0.1.0's
+// install instructions put it there.
+//
+// So this ranks with the GitHub line in the panel: one is where to send a log
+// when something breaks, and this is the single thing most likely to be
+// broken. It returns:
+//
+//   0  correct - a private copy under a subfolder, none beside the exe
+//   1  WRONG   - a copy sits beside the exe; move it into the mgpu folder
+//   2  MISSING - nvngx_dlssnr.dll is nowhere findable; neural cannot start
+//
+// Filesystem only. Safe to call while drawing, before anything arms, and in a
+// recovery launch where NGX is deliberately untouched.
+int ui_install_layout();
 
 // P7.4. The intensity SHAPE, held as a mode rather than written once:
 //   0 manual  - per-pass values as they are, nothing rewritten
@@ -392,8 +609,56 @@ void stream_request();
 // GAME thread, every frame, with the game's command list open. Filters by
 // adapter LUID; signals the previous frame's fence value before recording the
 // current one, because ReShade executes our list after this returns.
+// R63: depth_handle is THIS FRAME's depth source, or 0 when ReShade has none.
+// Zero is not an error - it is the seal's depth_valid, and it is what stops a
+// menu's flat plane of zeros from reaching the model. The CALLER issues the
+// transition around this call, because ReShade owns that resource and R56
+// proved ReShade's own mapping is the correct one for it.
+// R78: mvec_handle is the VELOCITY BUFFER the probe published, or 0 when it
+// has not published one yet. It is used ONLY at arm time, to size the slot's
+// MVec region from the resource; the per-frame copy does not come through
+// here, because by the time this event fires the buffer is a render target
+// again. See stream_mvec_copy.
+// L3. The produced-count signal, moved off the effects event.
+//
+// stream_on_finish_effects signals gfence for the frame BEFORE the one it is
+// handling, because ReShade executes the list we record into AFTER that handler
+// returns - so a signal issued there would sit ahead of our own copy. That
+// costs a full frame: the fence cannot report frame N until frame N+1's effects
+// event fires, and L1 measured the consequence as a backlog pinned at 3.
+//
+// By the time ReShade raises PRESENT for frame N, that list has necessarily
+// been submitted - which is the same guarantee the next-frame delay was buying,
+// one event earlier. Signalling here removes the structural frame.
+//
+// Off unless SignalAt=1, so every run before 2026-09-12 stays reproducible.
+// If ReShade turns out to submit after this event rather than before, the
+// consumer reads a slot whose copy has not landed and the SEAL checker says so
+// on the first frame - bad_magic or a contract mismatch, loudly, not silently.
+void stream_on_present(void *cmd_queue);
+
 void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
-                              unsigned long long rtv_handle);
+                              unsigned long long rtv_handle,
+                              unsigned long long depth_handle,
+                              unsigned long long mvec_handle);
+
+// GAME thread, MID-FRAME, from the render-target bind event - and that is the
+// whole reason it is a separate entry point rather than another argument
+// above.
+//
+// The velocity buffer is a transient. The engine writes it while drawing the
+// scene and has bound it as a render target again by the time effects run, so
+// finish_effects is too late to read it: the only moment it holds this
+// frame's motion is the moment the bind event names it. This records a copy
+// into the slot the current frame is about to seal.
+//
+// THE CALLER ISSUES THE BARRIER - render_target -> copy_source and back -
+// because that transition belongs to a ReShade type and this file holds none.
+// Same boundary the depth copy uses, for the same reason.
+//
+// Inert unless MVec=3 and the stream is armed, so a colour-only or synthetic
+// run costs one mutex and two loads per frame.
+void stream_mvec_copy(void *cmd_list, unsigned long long mvec_handle);
 
 // Bridge thread, once per present. Consumes whatever the fence says has
 // arrived, checks each seal, and prints the summary once the producer has

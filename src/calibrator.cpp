@@ -1,0 +1,1014 @@
+// ---------------------------------------------------------------------------
+// calibrator.cpp - R101. THE CALIBRATOR.
+//
+// See calibrator.hpp for why this exists. This file is the mechanism.
+//
+// THE INTERCEPTION POINT, and why it is an import table and not a code patch.
+// Both routes into NGX resolve NVSDK_NGX_D3D12_EvaluateFeature by name through
+// GetProcAddress - Dragon Sword from its own statically linked SDK glue,
+// Plague Tale from inside sl.common.dll. So the function pointer the caller
+// ends up holding came out of GetProcAddress, and GetProcAddress itself is an
+// IMPORTED symbol sitting in a writable slot in every module's import address
+// table. Swapping that slot is a single aligned pointer store. Nothing is
+// patched inside anyone's code, no instruction is relocated, no length
+// disassembler is needed, and putting it back is the same store in reverse.
+// That is why there is no third-party dependency here.
+//
+// MATCHING BY ADDRESS, NOT BY DLL NAME. Modern binaries import GetProcAddress
+// from an API set - api-ms-win-core-libraryloader-l1-2-0.dll and friends -
+// rather than from kernel32.dll, and which one varies by toolchain and by
+// Windows build. Walking descriptors looking for "kernel32.dll" therefore
+// misses real callers. So this walks EVERY descriptor and EVERY thunk in the
+// module and compares the SLOT'S CURRENT VALUE against the real
+// GetProcAddress address. An api-set forwards to the same function, so the
+// resolved pointer is identical and the comparison cannot be fooled by naming.
+//
+// WHAT WE DELIBERATELY DO NOT PATCH: our own module. gpu1_context resolves the
+// same entry point to drive DLSS-NR, and if its IAT were patched our own
+// evaluates would be captured as if they were the game's - we would read our
+// own settings back and call it ground truth. Skipping self is what keeps the
+// tap a measurement of the GAME.
+//
+// THE ONE HONEST LIMITATION. If a module called GetProcAddress and stored the
+// result BEFORE this file installed, patching its import slot afterwards
+// changes nothing - it is holding the real pointer in a variable we cannot
+// see. The addon loads at ReShade init, which is before a game creates its
+// DLSS feature in every title measured so far, so this should not bite. It is
+// not silent if it does: resolved=0 with evaluates=0 in the R101 line means
+// exactly this and nothing else, and the barrier path is untouched and still
+// driving.
+// ---------------------------------------------------------------------------
+
+#include "calibrator.hpp"
+#include "diag.hpp"
+
+#include <tlhelp32.h>
+#include <d3d12.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+
+// The pinned NGX headers, fetched by CI at NGX_SHA and flattened to ext/ngx.
+// nvsdk_ngx_d3d12.h does not exist in that tree; the D3D12 entry points are
+// declared in nvsdk_ngx.h itself. Same include this project already uses.
+#include "../ext/ngx/nvsdk_ngx.h"
+
+namespace mgpu
+{
+namespace calibrator
+{
+namespace
+{
+
+// ---- KEY NAMES, EVERY ONE CHECKED AGAINST THE PINNED HEADER ----
+//
+// R101a. The first draft of this file wrote these from memory and hedged the
+// uncertain ones with #ifdef fallbacks to string literals. One of them was
+// wrong in a way no fallback could catch: there is no
+// NVSDK_NGX_Parameter_DLSS_Depth_Inverted. Depth inversion is bit 3 of the
+// CREATE FLAGS, not a per-frame key - so the fallback string would have read
+// back as "absent" on every title forever, and the have-bits would have
+// reported that absence as a fact about the game.
+//
+// So the fallbacks are gone. Every name below is the macro as it appears in
+// NVIDIA/DLSS include/nvsdk_ngx_defs.h at the SHA build.yml pins, READ from
+// the file rather than recalled. If the pin moves and a name moves with it,
+// this is a compile error - which is the failure we want, not a field that
+// quietly stops being populated.
+//
+// Note NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X: the macro has no
+// underscore before Base even though its string value does. That asymmetry is
+// in the header, not a typo here.
+#define K_COLOR  NVSDK_NGX_Parameter_Color
+#define K_DEPTH  NVSDK_NGX_Parameter_Depth
+#define K_MVEC   NVSDK_NGX_Parameter_MotionVectors
+#define K_OUTPUT NVSDK_NGX_Parameter_Output
+#define K_MVSX   NVSDK_NGX_Parameter_MV_Scale_X
+#define K_MVSY   NVSDK_NGX_Parameter_MV_Scale_Y
+#define K_JX     NVSDK_NGX_Parameter_Jitter_Offset_X
+#define K_JY     NVSDK_NGX_Parameter_Jitter_Offset_Y
+#define K_RESET  NVSDK_NGX_Parameter_Reset
+#define K_W      NVSDK_NGX_Parameter_Width
+#define K_H      NVSDK_NGX_Parameter_Height
+#define K_OW     NVSDK_NGX_Parameter_OutWidth
+#define K_OH     NVSDK_NGX_Parameter_OutHeight
+#define K_FLAGS  NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags
+#define K_QUAL   NVSDK_NGX_Parameter_PerfQualityValue
+#define K_SUB_W  NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width
+#define K_SUB_H  NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height
+#define K_CSX    NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X
+#define K_CSY    NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y
+#define K_DSX    NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X
+#define K_DSY    NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y
+#define K_MSX    NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X
+#define K_MSY    NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y
+#define K_OSX    NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X
+#define K_OSY    NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y
+#define K_DYN_MINW NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width
+#define K_DYN_MINH NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height
+#define K_DYN_MAXW NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width
+#define K_DYN_MAXH NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height
+
+// ---- The two entry points we care about, spelled exactly as resolved ----
+const char *const NAME_EVAL   = "NVSDK_NGX_D3D12_EvaluateFeature";
+const char *const NAME_CREATE = "NVSDK_NGX_D3D12_CreateFeature";
+
+typedef NVSDK_NGX_Result(NVSDK_CONV *pf_evaluate)(
+    ID3D12GraphicsCommandList *InCmdList,
+    const NVSDK_NGX_Handle *InFeatureHandle,
+    const NVSDK_NGX_Parameter *InParameters,
+    void *InCallback);
+
+typedef NVSDK_NGX_Result(NVSDK_CONV *pf_create)(
+    ID3D12GraphicsCommandList *InCmdList,
+    NVSDK_NGX_Feature InFeatureID,
+    NVSDK_NGX_Parameter *InParameters,
+    NVSDK_NGX_Handle **OutHandle);
+
+typedef FARPROC(WINAPI *pf_gpa)(HMODULE, LPCSTR);
+
+// ---- STATE ----
+
+std::atomic<int>  g_mode{0};
+std::atomic<bool> g_installed{false};
+const char *g_site = "?";   // R101b: which event installed us
+
+pf_gpa      g_real_gpa   = nullptr;
+pf_evaluate g_real_eval  = nullptr;
+pf_create   g_real_create= nullptr;
+
+HMODULE g_self = nullptr;
+
+// Counters. Every one of these answers a question the log would otherwise have
+// to guess at, which is the standing rule in this project after R80.
+std::atomic<unsigned long long> g_gpa_calls{0};    // GetProcAddress seen
+std::atomic<unsigned long long> g_resolved{0};     // times NGX eval handed out
+std::atomic<unsigned long long> g_evals{0};        // evaluates intercepted
+std::atomic<unsigned long long> g_captures{0};     // evaluates we read
+std::atomic<unsigned long long> g_creates{0};      // CreateFeature seen
+std::atomic<unsigned long long> g_slots{0};        // IAT slots patched
+std::atomic<unsigned long long> g_modules{0};      // modules walked
+std::atomic<unsigned long long> g_cost_ns{0};      // total ns inside capture
+std::atomic<unsigned long long> g_frames{0};
+
+// ---- R106 state. IN THE ANONYMOUS NAMESPACE ON PURPOSE ----
+// hook_evaluate is defined below and reads these, so they have to be declared
+// above it. The first cut of this put them next to the public setters, which
+// sit after the anonymous namespace closes - five undeclared-identifier
+// errors, all of them ordering.
+typedef void (*pf_mvec_hook)(void *, unsigned long long);
+pf_mvec_hook g_mvec_hook_fn = nullptr;
+std::atomic<int> g_eval_copy_mode{0};
+std::atomic<unsigned long long> g_eval_copies{0};
+std::atomic<unsigned long long> g_eval_skips{0};
+unsigned long long g_eval_last_frame = 0xFFFFFFFFFFFFFFFFull;
+
+// The tracked feature. Streamline and the SDK both create several features in
+// one process - super sampling, frame generation, reflex - and only one of
+// them carries the parameter block we want. If we see a CreateFeature we learn
+// which handle is which; if we never see one (we installed after creation) we
+// fall back to accepting any handle and SAY SO in the log rather than
+// pretending we filtered.
+std::atomic<unsigned long long> g_sr_handle{0};
+std::atomic<bool> g_handle_known{false};
+
+// The create flags, latched at CreateFeature. They are a CREATE-time fact, so
+// the evaluate path cannot be relied on to carry them - but it is tried there
+// too, because Streamline builds its own block and may keep them in it.
+std::atomic<unsigned int> g_flags{0};
+std::atomic<bool> g_flags_known{false};
+
+// Bit positions from NVSDK_NGX_DLSS_Feature_Flags in the pinned header:
+// IsHDR 0, MVLowRes 1, MVJittered 2, DepthInverted 3, DoSharpening 5,
+// AutoExposure 6, AlphaUpscaling 7.
+void decode_flags(unsigned int fl, table &t)
+{
+    t.create_flags   = fl;
+    t.is_hdr         = (fl >> 0) & 1u;
+    t.mv_low_res     = (fl >> 1) & 1u;
+    t.mv_jittered    = (fl >> 2) & 1u;
+    t.depth_inverted = (fl >> 3) & 1u;
+    t.auto_exposure  = (fl >> 6) & 1u;
+}
+
+// ---- THE PUBLISHED TABLE, as a seqlock ----
+//
+// Written on the game's render thread inside EvaluateFeature, read from
+// finish-effects. A mutex here would be a wait on the render thread mid-frame,
+// which is DEFECT E exactly, and DEFECT E cost 60 -> 49.8 fps. So: even
+// sequence means stable, odd means a write is in progress, and the reader
+// retries a bounded number of times and then gives up. A reader that gives up
+// costs one frame of staleness. A writer that waits costs the game.
+std::atomic<unsigned> g_seq{0};
+table g_tbl{};
+
+double g_qpc_to_ns = 0.0;
+
+unsigned long long qpc()
+{
+    LARGE_INTEGER v;
+    QueryPerformanceCounter(&v);
+    return (unsigned long long)v.QuadPart;
+}
+
+void qpc_init()
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    g_qpc_to_ns = (f.QuadPart != 0) ? (1000000000.0 / (double)f.QuadPart) : 0.0;
+}
+
+// ---- READING THE PARAMETER BLOCK ----
+//
+// Get() returns a result code per key. A key the game never set comes back
+// failed, and that is INFORMATION - it is how we will find out that Streamline
+// populates a different subset than the raw SDK path does. So every read sets
+// a have-bit and nothing is defaulted silently.
+inline bool ok(NVSDK_NGX_Result r)
+{
+#ifdef NVSDK_NGX_SUCCEED
+    return NVSDK_NGX_SUCCEED(r) != 0;
+#else
+    return r == NVSDK_NGX_Result_Success;
+#endif
+}
+
+bool get_res(const NVSDK_NGX_Parameter *p, const char *k, unsigned long long &out)
+{
+    ID3D12Resource *r = nullptr;
+    if (!ok(p->Get(k, &r)) || r == nullptr) return false;
+    out = (unsigned long long)(uintptr_t)r;
+    return true;
+}
+
+bool get_u(const NVSDK_NGX_Parameter *p, const char *k, unsigned int &out)
+{
+    unsigned int v = 0;
+    if (!ok(p->Get(k, &v))) return false;
+    out = v;
+    return true;
+}
+
+bool get_f(const NVSDK_NGX_Parameter *p, const char *k, float &out)
+{
+    float v = 0.0f;
+    if (!ok(p->Get(k, &v))) return false;
+    out = v;
+    return true;
+}
+
+void capture(const NVSDK_NGX_Parameter *p)
+{
+    if (p == nullptr) return;
+
+    const unsigned long long t0 = qpc();
+
+    table t{};
+    t.frame = g_frames.load(std::memory_order_relaxed);
+    t.evals = g_evals.load(std::memory_order_relaxed);
+
+    if (get_res(p, K_COLOR,  t.color))  t.have |= KEY_COLOR;
+    if (get_res(p, K_DEPTH,  t.depth))  t.have |= KEY_DEPTH;
+    if (get_res(p, K_MVEC,   t.mvec))   t.have |= KEY_MVEC;
+    if (get_res(p, K_OUTPUT, t.output)) t.have |= KEY_OUTPUT;
+
+    if (get_f(p, K_MVSX, t.mv_scale_x) && get_f(p, K_MVSY, t.mv_scale_y))
+        t.have |= KEY_MV_SCALE;
+    if (get_f(p, K_JX, t.jitter_x) && get_f(p, K_JY, t.jitter_y))
+        t.have |= KEY_JITTER;
+
+    if (get_u(p, K_RESET, t.reset)) t.have |= KEY_RESET;
+
+    // Flags: prefer this block if it carries them, else the value latched at
+    // CreateFeature. Either way they are decoded from ONE word, so
+    // depth_inverted and mv_low_res can never disagree with each other.
+    unsigned int fl = 0;
+    if (get_u(p, K_FLAGS, fl))
+    {
+        decode_flags(fl, t);
+        t.have |= KEY_FLAGS;
+        g_flags.store(fl, std::memory_order_relaxed);
+        g_flags_known.store(true, std::memory_order_relaxed);
+    }
+    else if (g_flags_known.load(std::memory_order_relaxed))
+    {
+        decode_flags(g_flags.load(std::memory_order_relaxed), t);
+        t.have |= KEY_FLAGS;
+    }
+
+    if (get_u(p, K_QUAL, t.perf_quality)) t.have |= KEY_QUALITY;
+
+    if (get_u(p, K_DYN_MINW, t.dyn_min_w) && get_u(p, K_DYN_MINH, t.dyn_min_h) &&
+        get_u(p, K_DYN_MAXW, t.dyn_max_w) && get_u(p, K_DYN_MAXH, t.dyn_max_h))
+        t.have |= KEY_DYNAMIC;
+
+    if (get_u(p, K_W,  t.render_w) && get_u(p, K_H,  t.render_h))
+        t.have |= KEY_RENDER_EXT;
+    if (get_u(p, K_OW, t.display_w) && get_u(p, K_OH, t.display_h))
+        t.have |= KEY_DISPLAY_EXT;
+
+    unsigned int sw = 0, sh = 0;
+    if (get_u(p, K_SUB_W, sw) && get_u(p, K_SUB_H, sh))
+    {
+        t.sub_w = sw;
+        t.sub_h = sh;
+        get_u(p, K_CSX, t.color_x); get_u(p, K_CSY, t.color_y);
+        get_u(p, K_DSX, t.depth_x); get_u(p, K_DSY, t.depth_y);
+        get_u(p, K_MSX, t.mvec_x);  get_u(p, K_MSY, t.mvec_y);
+        get_u(p, K_OSX, t.out_x);   get_u(p, K_OSY, t.out_y);
+        t.have |= KEY_SUBRECTS;
+    }
+
+    // Publish. Odd sequence while the fields are in flux.
+    g_seq.fetch_add(1u, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_tbl = t;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_seq.fetch_add(1u, std::memory_order_release);
+
+    g_captures.fetch_add(1, std::memory_order_relaxed);
+    g_cost_ns.fetch_add((unsigned long long)((double)(qpc() - t0) * g_qpc_to_ns),
+                        std::memory_order_relaxed);
+}
+
+// ---- THE HOOKS ----
+
+NVSDK_NGX_Result NVSDK_CONV hook_evaluate(ID3D12GraphicsCommandList *cl,
+                                          const NVSDK_NGX_Handle *h,
+                                          const NVSDK_NGX_Parameter *p,
+                                          void *cb)
+{
+    g_evals.fetch_add(1, std::memory_order_relaxed);
+
+    const int m = g_mode.load(std::memory_order_relaxed);
+    if (m != 0)
+    {
+        // Filter to the super-sampling feature IF we were present for its
+        // creation. If we were not, take everything - a table from the wrong
+        // feature is visible in the diff against Dragon Sword, whereas taking
+        // nothing teaches us nothing at all.
+        bool take = true;
+        if (g_handle_known.load(std::memory_order_relaxed))
+            take = ((unsigned long long)(uintptr_t)h ==
+                    g_sr_handle.load(std::memory_order_relaxed));
+
+        // Latch mode stops reading once it has a table with the fields that
+        // matter. Live mode never stops, which is the whole point: a
+        // resolution or DLSS preset change destroys these resources and
+        // recreates them, and a handle latched across that is a dead pointer.
+        if (take && m == 1 &&
+            (g_tbl.have & (KEY_MVEC | KEY_MV_SCALE)) == (KEY_MVEC | KEY_MV_SCALE))
+            take = false;
+
+        if (take)
+        {
+            capture(p);
+
+            // ---- R106: THE COPY, TAKEN HERE INSTEAD OF AT A BARRIER ----
+            // Before the real evaluate runs, because the game has finished
+            // writing the buffer - that is why it is handing it over.
+            const int ec = g_eval_copy_mode.load(std::memory_order_relaxed);
+            if (ec != 0 && cl != nullptr && g_mvec_hook_fn != nullptr)
+            {
+                // ---- R106b: ONCE PER FRAME, AND ONLY THE SUPERSAMPLING
+                //      FEATURE. THIS IS WHAT WAS CORRUPTING THE PICTURE ----
+                //
+                // MEASURED, Plague: eval-copies=6002 against 3001 sealed
+                // frames. Exactly 2:1. This title creates TWO NGX features
+                // (creates=2 - frame generation is in that folder) and both
+                // were reaching the copy, so every frame got the scene's
+                // vectors overwritten by frame generation's. That is strobing
+                // while standing still and colour drift, exactly as reported.
+                //
+                // Two guards, and BOTH are required. The handle filter alone
+                // is not enough because a feature can evaluate more than once
+                // per frame; the frame dedupe alone is not enough because the
+                // wrong feature might win the race to be first.
+                //
+                // If sr-handle is not known - we were not present for
+                // CreateFeature - we take NOTHING here rather than guess.
+                // Publishing the table from an unfiltered evaluate is a
+                // reading; COPYING from one is corruption, and the two do not
+                // deserve the same permissiveness.
+                const unsigned long long fr =
+                    g_frames.load(std::memory_order_relaxed);
+                const bool sr_ok =
+                    g_handle_known.load(std::memory_order_relaxed) &&
+                    ((unsigned long long)(uintptr_t)h ==
+                     g_sr_handle.load(std::memory_order_relaxed));
+
+                if (!sr_ok || g_eval_last_frame == fr)
+                {
+                    g_eval_skips.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                g_eval_last_frame = fr;
+                table et;
+                if (read(et) && (et.have & KEY_MVEC) != 0u && et.mvec != 0ull)
+                {
+                    ID3D12Resource *r = (ID3D12Resource *)(uintptr_t)et.mvec;
+                    const D3D12_RESOURCE_STATES SR = (D3D12_RESOURCE_STATES)
+                        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+                    D3D12_RESOURCE_BARRIER b = {};
+                    b.Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+                    b.Transition.pResource   = r;
+                    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    b.Transition.StateBefore = SR;
+                    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    cl->ResourceBarrier(1, &b);
+
+                    g_mvec_hook_fn((void *)cl, et.mvec);
+
+                    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    b.Transition.StateAfter  = SR;
+                    cl->ResourceBarrier(1, &b);
+
+                    g_eval_copies.fetch_add(1, std::memory_order_relaxed);
+                }
+                }
+            }
+        }
+    }
+
+    if (g_real_eval == nullptr) return NVSDK_NGX_Result_Fail;
+    return g_real_eval(cl, h, p, cb);
+}
+
+NVSDK_NGX_Result NVSDK_CONV hook_create(ID3D12GraphicsCommandList *cl,
+                                        NVSDK_NGX_Feature id,
+                                        NVSDK_NGX_Parameter *p,
+                                        NVSDK_NGX_Handle **out)
+{
+    g_creates.fetch_add(1, std::memory_order_relaxed);
+
+    if (g_real_create == nullptr) return NVSDK_NGX_Result_Fail;
+    const NVSDK_NGX_Result r = g_real_create(cl, id, p, out);
+
+    if (ok(r) && out != nullptr && *out != nullptr &&
+        id == NVSDK_NGX_Feature_SuperSampling)
+    {
+        g_sr_handle.store((unsigned long long)(uintptr_t)(*out),
+                          std::memory_order_relaxed);
+        g_handle_known.store(true, std::memory_order_relaxed);
+
+        // THE ONE PLACE THE CREATE FLAGS ARE GUARANTEED TO EXIST. Read here,
+        // from the block the game just used, before anything else touches it.
+        unsigned int fl = 0;
+        if (p != nullptr && ok(p->Get(K_FLAGS, &fl)))
+        {
+            g_flags.store(fl, std::memory_order_relaxed);
+            g_flags_known.store(true, std::memory_order_relaxed);
+        }
+    }
+    return r;
+}
+
+FARPROC WINAPI hook_gpa(HMODULE mod, LPCSTR name)
+{
+    FARPROC real = (g_real_gpa != nullptr) ? g_real_gpa(mod, name)
+                                           : GetProcAddress(mod, name);
+    // HIWORD(name)==0 means resolution by ordinal, and the pointer is not a
+    // string at all. Dereferencing it is the classic crash in code that does
+    // this, so it is checked before any strcmp.
+    if (real == nullptr || name == nullptr || ((ULONG_PTR)name >> 16) == 0) return real;
+
+    g_gpa_calls.fetch_add(1, std::memory_order_relaxed);
+
+    if (std::strcmp(name, NAME_EVAL) == 0)
+    {
+        g_real_eval = (pf_evaluate)real;
+        g_resolved.fetch_add(1, std::memory_order_relaxed);
+        return (FARPROC)&hook_evaluate;
+    }
+    if (std::strcmp(name, NAME_CREATE) == 0)
+    {
+        g_real_create = (pf_create)real;
+        return (FARPROC)&hook_create;
+    }
+    return real;
+}
+
+// ---- IAT WALK ----
+//
+// Patches every import slot in `mod` whose CURRENT VALUE is `find`, replacing
+// it with `repl`. Value comparison rather than name comparison is what makes
+// this immune to api-set naming, and it is also what makes uninstall exact:
+// swapping repl back to find visits the same slots.
+unsigned patch_module(HMODULE mod, void *find, void *repl)
+{
+    if (mod == nullptr || find == nullptr) return 0;
+
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    const IMAGE_DATA_DIRECTORY &dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0 || dir.Size == 0) return 0;
+
+    // volatile because __except returns it: MSVC does not guarantee a
+    // non-volatile local modified inside __try survives the unwind.
+    volatile unsigned hits = 0;
+    IMAGE_IMPORT_DESCRIPTOR *imp =
+        (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
+
+    // A structured handler is not optional here. Walking another module's
+    // headers is reading memory whose layout we are trusting, and a packed or
+    // partially unmapped module is a real thing in shipped games. Faulting in
+    // the addon's install path would take the game with it.
+    __try
+    {
+        for (; imp->Name != 0; ++imp)
+        {
+            if (imp->FirstThunk == 0) continue;
+            IMAGE_THUNK_DATA *t = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+            for (; t->u1.Function != 0; ++t)
+            {
+                if ((void *)(uintptr_t)t->u1.Function != find) continue;
+
+                DWORD old = 0;
+                if (!VirtualProtect(&t->u1.Function, sizeof(void *),
+                                    PAGE_READWRITE, &old))
+                    continue;
+                t->u1.Function = (ULONGLONG)(uintptr_t)repl;
+                VirtualProtect(&t->u1.Function, sizeof(void *), old, &old);
+                ++hits;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return (unsigned)hits;
+    }
+    return (unsigned)hits;
+}
+
+// Walks every module in the process except our own. Called at install and
+// again from note_frame while we are still waiting for NGX to show up, which
+// is how a DLL loaded after us gets patched without hooking LoadLibrary.
+unsigned scan_and_patch(void *find, void *repl)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    unsigned hits = 0, mods = 0;
+
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            if (me.hModule == g_self) continue;   // never wrap our own calls
+            ++mods;
+            hits += patch_module(me.hModule, find, repl);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+
+    g_modules.store(mods, std::memory_order_relaxed);
+    return hits;
+}
+
+// ---- R102: THE CACHED-POINTER SCAN. THE RUNG ABOVE THE IMPORT SWAP ----
+//
+// WHY IT EXISTS. Plague Tale reported slots=44 resolved=0: every import table
+// in the process patched, and nobody asked. sl.interposer.dll IS the D3D12
+// entry point - it wraps D3D12CreateDevice - so Streamline is loaded and
+// initialised BEFORE ReShade's redirect ever runs, which is before this
+// add-on can exist. There is no ReShade event earlier than add-on load, so
+// the ordering is unwinnable from inside an add-on. Streamline had already
+// resolved the entry point and stashed it in its own data section, where an
+// import-table patch cannot reach.
+//
+// THE INSIGHT: we know the exact value to look for. GetProcAddress on the
+// already-loaded nvngx module hands us the real address. So walk the WRITABLE
+// DATA sections of every module, find 8-byte words equal to that address, and
+// swap them. It is the same pointer store the import patch does, just in
+// .data instead of the IAT - no code bytes touched, no trampoline, no length
+// disassembler, and reversible by the identical mechanism.
+//
+// WHAT IS SKIPPED AND WHY IT MATTERS. Our own module, always: g_real_eval
+// holds that exact address, and swapping it would point this file's
+// pass-through at itself - unbounded recursion on the first frame. The nvngx
+// module itself is skipped for the same class of reason. Executable sections
+// are skipped because a matching word there is an immediate operand, not a
+// pointer slot.
+//
+// FALSE POSITIVES. A word equal to the address of one specific NGX export is
+// that pointer. Any other module holding it is holding it for the same
+// reason, and swapping it is what we want.
+//
+// WHAT WOULD DEFEAT IT: a caller that re-resolves per call, or keeps the
+// pointer only in a register. Then hits=0 and we fall to the import swap,
+// which is what already runs today. It cannot make anything worse.
+unsigned patch_module_data(HMODULE mod, HMODULE skip, void *find, void *repl)
+{
+    if (mod == nullptr || mod == g_self || mod == skip || find == nullptr) return 0;
+
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    volatile unsigned hits = 0;
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    const unsigned nsec = nt->FileHeader.NumberOfSections;
+
+    __try
+    {
+        for (unsigned i = 0; i < nsec; ++i, ++sec)
+        {
+            if ((sec->Characteristics & IMAGE_SCN_MEM_WRITE) == 0) continue;
+            if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) continue;
+
+            BYTE *p = base + sec->VirtualAddress;
+            SIZE_T len = (SIZE_T)sec->Misc.VirtualSize;
+            if (len < sizeof(void *)) continue;
+            len -= sizeof(void *);
+
+            for (SIZE_T off = 0; off <= len; off += sizeof(void *))
+            {
+                void **slot = (void **)(p + off);
+                if (*slot != find) continue;
+
+                DWORD old = 0;
+                if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old))
+                    continue;
+                *slot = repl;
+                VirtualProtect(slot, sizeof(void *), old, &old);
+                ++hits;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return (unsigned)hits;
+    }
+    return (unsigned)hits;
+}
+
+// The driver module, by the two names it ships under. Returns nullptr until
+// something has loaded it - which is why the scan is retried rather than done
+// once at install.
+HMODULE ngx_module()
+{
+    HMODULE m = GetModuleHandleW(L"_nvngx.dll");
+    if (m == nullptr) m = GetModuleHandleW(L"nvngx.dll");
+    return m;
+}
+
+std::atomic<unsigned long long> g_dslots{0};
+
+unsigned scan_cached_pointers()
+{
+    HMODULE ngx = ngx_module();
+    if (ngx == nullptr) return 0;
+
+    void *ev = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_EVAL)
+                                   : GetProcAddress(ngx, NAME_EVAL));
+    if (ev == nullptr) return 0;
+    void *cr = (void *)(g_real_gpa ? g_real_gpa(ngx, NAME_CREATE)
+                                   : GetProcAddress(ngx, NAME_CREATE));
+
+    // Already ours: a previous scan took. Nothing to do.
+    if (ev == (void *)&hook_evaluate) return 0;
+
+    unsigned hits = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            hits += patch_module_data(me.hModule, ngx, ev, (void *)&hook_evaluate);
+            if (cr != nullptr)
+                hits += patch_module_data(me.hModule, ngx, cr, (void *)&hook_create);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+
+    if (hits != 0)
+    {
+        g_real_eval = (pf_evaluate)ev;
+        if (cr != nullptr) g_real_create = (pf_create)cr;
+        g_dslots.fetch_add(hits, std::memory_order_relaxed);
+        g_resolved.fetch_add(1, std::memory_order_relaxed);
+    }
+    return hits;
+}
+
+// The reverse, for detach. Same walk, swapped arguments.
+void unscan_cached_pointers()
+{
+    HMODULE ngx = ngx_module();
+    if (ngx == nullptr || g_real_eval == nullptr) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    if (Module32FirstW(snap, &me))
+    {
+        do
+        {
+            patch_module_data(me.hModule, ngx, (void *)&hook_evaluate,
+                              (void *)g_real_eval);
+            if (g_real_create != nullptr)
+                patch_module_data(me.hModule, ngx, (void *)&hook_create,
+                                  (void *)g_real_create);
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+}
+
+std::mutex g_install_cs;
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+
+std::atomic<int> g_jmode{0};
+float g_jpx = 0.0f, g_jpy = 0.0f;
+bool  g_jprobed = false;
+
+void set_mvec_hook(void (*fn)(void *, unsigned long long))
+{
+    g_mvec_hook_fn = fn;
+}
+
+void set_eval_copy(int mode)
+{
+    g_eval_copy_mode.store(mode, std::memory_order_relaxed);
+}
+
+bool g_scale_said = false;
+
+void override_scale(float &sx, float &sy)
+{
+    if (g_mode.load(std::memory_order_relaxed) == 0) return;
+
+    table t;
+    if (!read(t)) return;
+    if ((t.have & KEY_MV_SCALE) == 0u) return;
+    if (t.mv_scale_x == 0.0f || t.mv_scale_y == 0.0f) return;
+
+    if (!g_scale_said)
+    {
+        g_scale_said = true;
+        char sl[420];
+        std::snprintf(sl, sizeof sl,
+            "[MGPU][R105] MVecScale NOW READ, NOT TYPED: ini said %.4f,%.4f - the game "
+            "says %.4f,%.4f (MVLowRes=%u). If those differ, the ini was wrong and this "
+            "is the fix; the ini value is still what gets used on any title where the "
+            "calibrator does not resolve.",
+            (double)sx, (double)sy, (double)t.mv_scale_x, (double)t.mv_scale_y,
+            t.mv_low_res);
+        mgpu::diag::info(sl);
+    }
+
+    sx = t.mv_scale_x;
+    sy = t.mv_scale_y;
+}
+
+void set_jitter_mode(int mode)
+{
+    g_jmode.store(mode, std::memory_order_relaxed);
+}
+
+void apply_jitter_offset(void *nr_params, float sx, float sy)
+{
+    const int m = g_jmode.load(std::memory_order_relaxed);
+    if (m == 0 || nr_params == nullptr) return;
+
+    table t;
+    if (!read(t)) return;
+    if ((t.have & KEY_JITTER) == 0u) return;
+    if (t.mv_jittered != 0u) return;      // the game already baked it in
+
+    // THE DELTA, not the absolute. A motion vector describes frame N-1 -> N
+    // and the two frames were jittered differently, so the correction is the
+    // difference between them. That part is settled by reasoning; only the
+    // SIGN is left for the rig, which is what InvertJitter is for.
+    const float g  = (m < 0) ? -1.0f : 1.0f;
+    const float ax = (sx != 0.0f) ? sx : 1.0f;
+    const float ay = (sy != 0.0f) ? sy : 1.0f;
+    const float ox = g * (t.jitter_x - g_jpx) / ax;
+    const float oy = g * (t.jitter_y - g_jpy) / ay;
+    g_jpx = t.jitter_x;
+    g_jpy = t.jitter_y;
+
+    NVSDK_NGX_Parameter *p = (NVSDK_NGX_Parameter *)nr_params;
+
+    // Two spellings: DLSS-NR's private set is undocumented, MV.Offset.X/Y is
+    // NGX's generic name. Setting a key the snippet does not know is inert.
+    p->Set("DLSSNR.MVecOffsetX", ox);
+    p->Set("DLSSNR.MVecOffsetY", oy);
+    p->Set("MV.Offset.X", ox);
+    p->Set("MV.Offset.Y", oy);
+
+    if (!g_jprobed)
+    {
+        g_jprobed = true;
+        float a = 0.0f, b = 0.0f;
+        const bool k1 = ok(p->Get("DLSSNR.MVecOffsetX", &a));
+        const bool k2 = ok(p->Get("MV.Offset.X", &b));
+        char jl[520];
+        std::snprintf(jl, sizeof jl,
+            "[MGPU][R104] JITTER COMP mode=%d | DLSSNR.MVecOffsetX readback=%d (%.6f) | "
+            "MV.Offset.X readback=%d (%.6f) | first delta %.6f,%.6f in VECTOR units "
+            "(MVecScale %.1f,%.1f, raw jitter %.4f,%.4f). BOTH readbacks 0 means DLSS-NR "
+            "has no motion vector offset parameter and this needs a compute pass on the "
+            "MVec copy - that is the finding, not a failure. Either one non-zero means the "
+            "fix is LIVE and only the sign is open: if the skin looks worse, set "
+            "InvertJitter=1 and run again. No rebuild for that.",
+            m, (int)k1, (double)a, (int)k2, (double)b, (double)ox, (double)oy,
+            (double)ax, (double)ay, (double)t.jitter_x, (double)t.jitter_y);
+        mgpu::diag::info(jl);
+    }
+}
+
+void install(int mode)
+{
+    if (mode == 0) return;                       // nothing touched at all
+    std::lock_guard<std::mutex> lk(g_install_cs);
+    if (g_installed.load(std::memory_order_relaxed)) return;
+
+    qpc_init();
+    g_mode.store(mode, std::memory_order_relaxed);
+
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&install, &g_self);
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    g_real_gpa = (pf_gpa)GetProcAddress(k32, "GetProcAddress");
+    if (g_real_gpa == nullptr) return;
+
+    const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
+    g_slots.fetch_add(hits, std::memory_order_relaxed);
+    // R102: the rung above. If a caller cached the pointer before we
+    // existed - Streamline always does - the import walk found nothing to
+    // reach it with, and this does.
+    const unsigned dh = scan_cached_pointers();
+    g_dslots.fetch_add(0, std::memory_order_relaxed);
+    g_site = (dh != 0) ? "data-scan" : ((hits != 0) ? "iat" : "iat-nohits");
+    g_installed.store(true, std::memory_order_relaxed);
+
+    char line[512];
+    std::snprintf(line, sizeof line,
+        "[MGPU][R101] CALIBRATOR INSTALLED mode=%d | %u import slot(s) patched "
+        "across %llu module(s). This is a POINTER SWAP, not a code patch - no "
+        "instruction anywhere in this process was modified, and Calib=0 puts "
+        "every slot back. Our own module is skipped so the bridge's own "
+        "DLSS-NR evaluates are never mistaken for the game's.",
+        mode, hits, g_modules.load(std::memory_order_relaxed));
+    mgpu::diag::info(line);
+}
+
+void uninstall()
+{
+    std::lock_guard<std::mutex> lk(g_install_cs);
+    if (!g_installed.load(std::memory_order_relaxed)) return;
+
+    unscan_cached_pointers();
+    scan_and_patch((void *)&hook_gpa, (void *)g_real_gpa);
+    g_mode.store(0, std::memory_order_relaxed);
+    g_installed.store(false, std::memory_order_relaxed);
+    mgpu::diag::info("[MGPU][R101] CALIBRATOR REMOVED. Import slots restored.");
+}
+
+bool read(table &out)
+{
+    if (g_captures.load(std::memory_order_relaxed) == 0) return false;
+
+    // Bounded, never blocking. Four tries is far more than a writer that only
+    // copies a POD struct will ever need, and giving up costs one frame of
+    // staleness rather than a wait on the frame path.
+    for (int i = 0; i < 4; ++i)
+    {
+        const unsigned s1 = g_seq.load(std::memory_order_acquire);
+        if ((s1 & 1u) != 0u) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        out = g_tbl;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_seq.load(std::memory_order_acquire) == s1) return true;
+    }
+    return false;
+}
+
+void note_frame()
+{
+    const unsigned long long f =
+        g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!g_installed.load(std::memory_order_relaxed)) return;
+
+    // The periodic report, on the SAME 300-frame cadence as the MVEC
+    // copies/missing line, so the two can be read side by side without
+    // interpolating between different clocks - which is exactly what reading
+    // the Plague Tale run cost.
+    if ((f % 300ull) == 0ull) log_summary();
+
+    // A module that loaded after us has an unpatched import table. Rather than
+    // hooking LoadLibrary - another interception, another thing to unwind -
+    // rescan on a slow cadence until NGX actually resolves, then stop. Thirty
+    // snapshots over the first half minute, then nothing.
+    if (g_resolved.load(std::memory_order_relaxed) != 0) return;
+    if ((f % 60ull) != 0ull || f > 1800ull) return;
+
+    const unsigned hits = scan_and_patch((void *)g_real_gpa, (void *)&hook_gpa);
+    if (hits != 0) g_slots.fetch_add(hits, std::memory_order_relaxed);
+
+    // R102. Retried, not done once: nvngx may not be loaded yet at install,
+    // and there is nothing to compare against until it is. Stops the moment
+    // anything resolves, by the guard at the top of this function.
+    if (scan_cached_pointers() != 0) g_site = "data-scan";
+}
+
+void log_summary()
+{
+    table t{};
+    const bool have = read(t);
+
+    const unsigned long long f  = g_frames.load(std::memory_order_relaxed);
+    const unsigned long long ns = g_cost_ns.load(std::memory_order_relaxed);
+    const double per_frame = (f != 0) ? (double)ns / (double)f : 0.0;
+
+    char line[3600];
+    int w = std::snprintf(line, sizeof line,
+        "[MGPU][R101] CALIBRATOR mode=%d site=%s | slots=%llu data-slots=%llu modules=%llu gpa-calls=%llu "
+        "| resolved=%llu creates=%llu sr-handle=%s | evaluates=%llu captured=%llu "
+        "| cost %.0f ns/frame | eval-copies=%llu eval-skips=%llu. ",
+        g_mode.load(std::memory_order_relaxed), g_site,
+        g_slots.load(std::memory_order_relaxed),
+        g_dslots.load(std::memory_order_relaxed),
+        g_modules.load(std::memory_order_relaxed),
+        g_gpa_calls.load(std::memory_order_relaxed),
+        g_resolved.load(std::memory_order_relaxed),
+        g_creates.load(std::memory_order_relaxed),
+        g_handle_known.load(std::memory_order_relaxed) ? "known" : "UNFILTERED",
+        g_evals.load(std::memory_order_relaxed),
+        g_captures.load(std::memory_order_relaxed),
+        per_frame, g_eval_copies.load(std::memory_order_relaxed),
+        g_eval_skips.load(std::memory_order_relaxed));
+
+    if (have && w > 0 && w < (int)sizeof line)
+    {
+        w += std::snprintf(line + w, sizeof line - (size_t)w,
+            "|| THE GAME'S OWN TABLE: color=0x%llx depth=0x%llx MVEC=0x%llx "
+            "output=0x%llx | MVecScale %.4f,%.4f | jitter %.4f,%.4f | Reset=%u "
+            "| CreateFlags=0x%x -> DepthInverted=%u MVLowRes=%u MVJittered=%u "
+            "IsHDR=%u AutoExposure=%u | quality=%u | render %ux%u -> display "
+            "%ux%u | dynamic %ux%u..%ux%u | subrect %ux%u at color(%u,%u) "
+            "depth(%u,%u) MV(%u,%u) out(%u,%u) | have=0x%x. ",
+            t.color, t.depth, t.mvec, t.output,
+            (double)t.mv_scale_x, (double)t.mv_scale_y,
+            (double)t.jitter_x, (double)t.jitter_y, t.reset,
+            t.create_flags, t.depth_inverted, t.mv_low_res, t.mv_jittered,
+            t.is_hdr, t.auto_exposure, t.perf_quality,
+            t.render_w, t.render_h, t.display_w, t.display_h,
+            t.dyn_min_w, t.dyn_min_h, t.dyn_max_w, t.dyn_max_h,
+            t.sub_w, t.sub_h, t.color_x, t.color_y, t.depth_x, t.depth_y,
+            t.mvec_x, t.mvec_y, t.out_x, t.out_y, t.have);
+    }
+
+    if (w > 0 && w < (int)sizeof line)
+    {
+        std::snprintf(line + w, sizeof line - (size_t)w,
+            "|| HOW TO READ IT. resolved=0 with evaluates=0 means no module "
+            "asked for the entry point after we installed - either the title "
+            "does not use DLSS, or it resolved before the addon loaded; the "
+            "barrier path is untouched either way and is still what drives. "
+            "sr-handle=UNFILTERED means we were not present for CreateFeature, "
+            "so the table may be from frame generation rather than super "
+            "sampling - check that render/display extents look like a "
+            "supersampling pair before trusting it. MVEC here is the GAME'S "
+            "answer to the question every round from R70 to R100 tried to "
+            "infer; if it does not equal the handle the barrier probe armed on "
+            "Dragon Sword, the probe was wrong on a title we believed, and "
+            "THAT is the finding. have=0 bits name the keys this producer does "
+            "not populate - Streamline and the raw SDK do not set the same "
+            "subset, and the difference is a fact about the route, not a bug. "
+            "MVLowRes IS DEFERRED OPTION 11 ANSWERED: 1 means the game's motion "
+            "vectors are at RENDER resolution, 0 means display resolution, and "
+            "we have been inferring that from buffer sizes since R83. Read it "
+            "together with MVecScale - a low-res field with a display-sized "
+            "scale is the shape that makes reprojection look almost right.");
+    }
+    mgpu::diag::info(line);
+}
+
+} // namespace calibrator
+} // namespace mgpu

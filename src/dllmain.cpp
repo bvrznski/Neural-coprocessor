@@ -75,6 +75,8 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "calibrator.hpp"
+#include "probe.hpp"
 #include "worker.hpp"
 
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
@@ -125,6 +127,45 @@ static void on_init_device(reshade::api::device *device)
     // here - brief rule 2 defers it to the swapchain-derived game LUID
     // (on_init_swapchain).
     mgpu::adapter::on_device(device);
+
+    // ---- R101b RETRACTED. init_device was the wrong place. ----
+    //
+    // MEASURED: Dragon Sword and Dawnwalker stopped LAUNCHING - "Failed to
+    // load add-on" on a SECOND D3D12CreateDevice, after the first instance
+    // had unregistered. Plague Tale survived because its init order creates
+    // the device once.
+    //
+    // The install site was not the real defect; it EXPOSED one. We patch
+    // GetProcAddress slots in ~150 modules and nothing ever put them back, so
+    // an add-on unload left every one of those slots pointing into a DLL that
+    // is no longer there. install() at init_device made that unload/reload
+    // cycle happen with the patches live. uninstall() is now called at
+    // detach - see DllMain - and the install goes back to the swapchain
+    // one-shot, which launched on every title.
+    //
+    // The early-install idea is NOT dead, but it needs a module walk that
+    // does not depend on ToolHelp and an unload path that is proven first.
+}
+
+// ---- R78: THE MOTION VECTOR TRANSPORT'S ONE LINE OF GLUE ----
+//
+// The probe calls this from the render-target bind event, mid-frame, with the
+// game's command list already open and the source already transitioned to
+// copy_source - the probe issues that barrier and puts it back, because the
+// barrier is a ReShade type and gpu1_context holds none.
+//
+// A FUNCTION POINTER RATHER THAN A CALL. probe.cpp does not include
+// gpu1_context.hpp and must not start: the probe is a diagnostic that has to
+// keep working in a build where the stream is inert, and a direct call would
+// make the acquisition layer depend on the transport layer. So the transport
+// hands the probe a pointer at startup and the probe knows nothing about what
+// is on the other end of it.
+//
+// Inert unless MVec=3 and the stream is armed - the check is inside
+// stream_mvec_copy, under the mutex that owns the answer.
+static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long resource)
+{
+    mgpu::gpu1::stream_mvec_copy(cmd_list_native, resource);
 }
 
 static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
@@ -139,6 +180,102 @@ static void on_init_swapchain(reshade::api::swapchain *swapchain, bool resize)
     // LUID overrides the provisional init_device value and runs the
     // one-shot selection (or a terminal refusal) - see adapter.cpp.
     mgpu::adapter::on_swapchain(swapchain, resize);
+
+    // P9.1. The presented size, handed to the probe so its candidate size band
+    // is a fraction of the user's resolution rather than a pixel count somebody
+    // guessed. Read here and not at the first frame because a filter that is
+    // wrong for the first few hundred resources is a filter that missed the
+    // engine's startup allocations, which is when scene buffers are created.
+    //
+    // R33 DEFECT. THIS WAS UNFILTERED AND IT SILENTLY BROKE THE SIZE BAND.
+    // init_swapchain fires for BOTH runtimes in this process, and the bridge's
+    // own present chain is 1280x720. It came up after the game's, so the band
+    // ended up a fraction of 1280x720 instead of the game's 2560x1440 - and
+    // 1664x936 scene depth is 1.69x the area of 1280x720, which the band's
+    // upper bound (1.05x) then REJECTS. The lane's candidates survived only
+    // because they were catalogued before the bridge chain existed; anything
+    // created after it was dropped, silently, and the R33 turn-open test that
+    // asks in_scene_band per clear returned false for every frame of a whole
+    // run. That is what a wrong filter looks like: not an error, an absence.
+    //
+    // The fix is the check note_frame twelve lines below has always had. When
+    // the game's LUID is not yet known nothing is passed at all, which leaves
+    // the band at its permissive fallback (w>=640 && h>=360) - being late with
+    // the real size costs a few loose candidates; being wrong about it costs
+    // the ones that matter.
+    if (swapchain != nullptr)
+    {
+        if (reshade::api::device *sd = swapchain->get_device())
+        {
+            mgpu::adapter::selection_result ssel;
+            mgpu::adapter::get_selection(ssel);
+            bool sc_is_game = false;
+            if (ssel.game_luid_known && sd->get_api() == reshade::api::device_api::d3d12)
+            {
+                if (auto *sd12 = reinterpret_cast<ID3D12Device *>(sd->get_native()))
+                {
+                    const LUID sl = sd12->GetAdapterLuid();
+                    sc_is_game = (sl.LowPart == ssel.game_luid.LowPart &&
+                                  sl.HighPart == ssel.game_luid.HighPart);
+                }
+            }
+            const reshade::api::resource bb = swapchain->get_back_buffer(0);
+            if (sc_is_game && bb.handle != 0)
+            {
+                const reshade::api::resource_desc bd = sd->get_resource_desc(bb);
+                mgpu::probe::note_scene_size(bd.texture.width, bd.texture.height);
+            }
+        }
+    }
+
+    // P9.1. The probe's one-shot init, here rather than in DllMain: this is a
+    // render thread with the loader lock released, so the ini read is a plain
+    // file read and register_event is on the thread ReShade raises events on.
+    // Guarded because init_swapchain fires again on resize, and re-reading the
+    // ini there would silently undo a toggle made in the overlay.
+    {
+        static bool probe_started = false;
+        if (!probe_started)
+        {
+            probe_started = true;
+
+            // ---- R78: INSTALL THE HOOK BEFORE THE FIRST set_mode ----
+            //
+            // The only ordering requirement in this block. The probe LATCHES
+            // its mvec lane on when a hook is installed, and that latch is
+            // read INSIDE set_mode - so a hook installed afterwards would
+            // leave the lane at whatever the ini asked for, and the latch
+            // would not take effect until the next mode change, which may
+            // never come.
+            //
+            // Unconditional, and deliberately not gated on the ini here: that
+            // would mean reading the same key in two files and being able to
+            // disagree with ourselves about it. The hook is inert unless
+            // MVec=3 and the stream is armed.
+            mgpu::probe::set_mvec_hook(&mgpu_mvec_transport_hook);
+
+            mgpu::probe::set_mode(mgpu::probe::mode_from_ini());
+
+            // ---- R101: THE NGX TAP, INSTALLED ON THE SAME ONE-SHOT ----
+            //
+            // After mode_from_ini, because that call is what parses the ini
+            // and therefore what Calib= has been read by. Installing here
+            // rather than in DllMain matters for the same reason the probe's
+            // init does: the loader lock is released on this thread, and
+            // walking every module's import table under the loader lock is
+            // how you deadlock a game at startup.
+            //
+            // Calib=0 returns immediately and touches nothing.
+            mgpu::calibrator::install(mgpu::probe::calib_mode());
+            mgpu::calibrator::set_jitter_mode(mgpu::probe::jitter_mode());
+
+            // R106. The SAME transport hook the probe uses - one copy path,
+            // two possible triggers, so the two can be compared directly
+            // instead of being two different pieces of code.
+            mgpu::calibrator::set_mvec_hook(&mgpu_mvec_transport_hook);
+            mgpu::calibrator::set_eval_copy(mgpu::probe::eval_copy_mode());
+        }
+    }
 }
 
 // ---- P1.6: what is actually painted on each runtime ----
@@ -274,6 +411,11 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         }
     }
 
+    // V19. Tell the bridge the panel is open, so AutoArm waits. Settings are
+    // read at arm time, so a menu that gets armed out from under the reader is
+    // a menu that does nothing.
+    mgpu::gpu1::ui_panel_drawn();
+
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
 
@@ -284,6 +426,34 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     else if (st.summarised)
         ImGui::TextUnformatted("Finished - ran to its bound. Restart the game to run another.");
 
+    // ========================= BOX 1: THE BRIDGE =========================
+    //
+    // Split into two boxes in V11 because the panel had become one column of
+    // unrelated things. This box is the NEURAL side - what the bridge does with
+    // the frame and how fast it is doing it. The DLSS box below is the
+    // UPSCALER's state, which is a different feature with a different handle
+    // and, unlike everything here, cannot be changed while armed.
+// ---- V12: TWO COLUMNS, NOT ONE TALL STACK ----
+    //
+    // The single column had grown past a screen, so the DLSS box was below the
+    // fold and you had to scroll to find it. Two children side by side, each
+    // scrolling on its own, puts both in view at once.
+    //
+    // IT FALLS BACK TO STACKED BELOW 640 px. A two-column layout in a narrow
+    // overlay is two unreadable columns, which is worse than scrolling. The
+    // overlay's width is the user's to change and we do not control it.
+    const float avail_w = ImGui::GetContentRegionAvail().x;
+    const bool  two_col = (avail_w >= 640.0f);
+    const float col_w   = two_col
+        ? (avail_w - ImGui::GetStyle().ItemSpacing.x) * 0.5f
+        : avail_w;
+    // Tall enough that neither column scrolls in the common case, short enough
+    // to leave the probe section visible underneath.
+    const float col_h   = 560.0f;
+
+    ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
+    ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
+    {
     // ---- Model tuning, first and always visible ----
     //
     // Moved to the top in P7.10. These are the controls the reference
@@ -402,9 +572,614 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("Overrun climbing = GPU 1 is past its budget at this pass count.");
     }
 
+    // ---- Live ----
+    //
+    // EVERY NUMBER HERE IS THE ONE ITS END-OF-RUN LOG LINE PRINTS, over the
+    // same divisor. If the panel and the log ever disagree, the panel is wrong
+    // and it is a bug, not a second opinion.
+    if (st.armed)
+    {
+        ImGui::SeparatorText("Live");
+        char lv[260];
+
+        snprintf(lv, sizeof lv, "fps   game %.1f   GPU 1 %.1f",
+                 st.fps_produced, st.fps_consumed);
+        ImGui::TextUnformatted(lv);
+        if (st.fps_consumed + 1.0 < st.fps_produced)
+            ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
+
+        if (st.gpu1_ts_ok)
+        {
+            snprintf(lv, sizeof lv,
+                     "GPU 1 ms  copy %.3f   unpack %.3f   EVALUATE %.3f   out %.3f",
+                     st.gpu1_copy_ms, st.gpu1_unpack_ms, st.gpu1_eval_ms, st.gpu1_out_ms);
+            ImGui::TextUnformatted(lv);
+            ImGui::TextDisabled(st.sr_on
+                ? "Evaluate spans every pass AND the reduce and upscale - not the neural cost alone."
+                : "Evaluate spans every pass - divide by the pass count to compare against one.");
+        }
+
+        snprintf(lv, sizeof lv, "latency  ready-to-consume %.2f ms   submit-to-consume %.2f ms",
+                 st.lat_ready_ms, st.lat_submit_ms);
+        ImGui::TextUnformatted(lv);
+        ImGui::TextDisabled("Bridge share only - the game's render before and the present after are not in it.");
+
+        snprintf(lv, sizeof lv, "GPU 0 queue  mean %.2f   max %llu frames behind",
+                 st.backlog_mean, st.backlog_max);
+        if (st.backlog_mean >= 2.5)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
+            ImGui::TextDisabled("Queueing deep. Reflex=1 in mgpu.ini, or turn it on in the game.");
+        }
+        else
+        {
+            ImGui::TextUnformatted(lv);
+            if (st.backlog_mean > 0.0 && st.backlog_mean <= 1.6)
+                ImGui::TextDisabled("1.0 is the structural floor, not an error. This is what low latency looks like.");
+        }
+
+        snprintf(lv, sizeof lv, "ring  %u slots%s   skipped by window %llu",
+                 st.ring_depth,
+                 (st.ring_window != 0) ? "  (window ON)" : "  (window off)",
+                 st.ring_skipped);
+        ImGui::TextUnformatted(lv);
+
+        if (st.reordered != 0 || st.bad_magic != 0 || st.contract != 0)
+        {
+            snprintf(lv, sizeof lv, "SEAL FAULTS  reordered %llu  bad magic %llu  contract %llu",
+                     st.reordered, st.bad_magic, st.contract);
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", lv);
+        }
+    }
+
+    }
+    ImGui::EndChild();   // ---- end BOX 1 ----
+
+    if (two_col) ImGui::SameLine();
+
+    // ====================== BOX 2: DLSS AND REFLEX ======================
+    //
+    // READ-ONLY, AND THAT IS A DECISION RATHER THAN AN OMISSION. Quality,
+    // preset and R are baked into an NGX feature handle at arm time. Changing
+    // one means releasing and rebuilding that handle mid-stream: a 200-450 ms
+    // stall on the bridge thread, down a teardown path that has crashed
+    // before. These are set in mgpu.ini and take effect on the next arm.
+    ImGui::BeginChild("mgpu_box_dlss", ImVec2(col_w, col_h), true);
+    ImGui::SeparatorText("DLSS  -  super resolution and Reflex");
+    {
+        char dl[300];
+
+        // ================= BEFORE ARM: THE SETTINGS MENU =================
+        //
+        // EVERY CONTROL HERE WRITES mgpu.ini IMMEDIATELY, and the arm reads
+        // that file, so a change made before arming applies to THIS session
+        // with no restart. That is the whole reason the menu is worth having,
+        // and the reason AutoArm holds while this panel is open.
+        //
+        // Only settings a user should touch are here. Passes, Depth, MVec and
+        // CopyQueue stay out on purpose: they are pipeline internals, and each
+        // one can produce a configuration nobody can support from a bug report.
+        if (!st.armed && !st.summarised)
+        {
+            // V26. Reflex is not read here - that control is gone. SRScale IS,
+            // because the mode buttons below now write it.
+            static bool m_loaded = false;
+            static bool m_sr = false;
+            static int  m_preset = 0, m_mode = 2;
+            if (!m_loaded)
+            {
+                m_loaded = true;
+                m_sr     = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
+                m_preset = mgpu::gpu1::ui_ini_read("SRPreset", 0);
+                m_mode   = mgpu::gpu1::ui_ini_read("SRQuality", 2);
+            }
+
+            // ---- V26: THE MODE SETS R. THE SAME LADDER THE ARMED VIEW USES ----
+            //
+            // quality 67, balanced 58, performance 50 - percent per axis, and
+            // 67 is DLSS Quality's own ratio. Identical to the armed view's
+            // APPLY and to stream_state::AUTO_LADDER, because three different
+            // ladders in one add-on is how a setting stops meaning anything.
+            //
+            // WHY THIS REPLACES THE DLAA TOGGLE ENTIRELY. Until now R was
+            // INHERITED from the game's render extent, so if the title was
+            // rendering at native - DLAA, or no DLSS at all - there was
+            // nothing smaller to enlarge and every button in this box did
+            // nothing. Four of the five titles measured 2026-09-13 were in
+            // exactly that state. The user saw a DLSS section with modes and
+            // presets that changed nothing, and a separate "DLAA mode" toggle
+            // whose relationship to it was not guessable.
+            //
+            // With R chosen here, the modes mean the same thing on every
+            // title whatever the game's own DLSS is set to, and the DLAA
+            // concept disappears from the interface because it was never a
+            // mode - it was the absence of one.
+            //
+            // SRMvLowRes RIDES WITH THE SCALE, ALWAYS. The flag without the
+            // scale is the combination that returned FAIL_PlatformError on
+            // 2026-09-12. They are one setting and they are written together
+            // in every path below.
+            const auto write_mode = [](int mode)
+            {
+                const int scale = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
+                mgpu::gpu1::ui_ini_write("SRQuality",  mode);
+                mgpu::gpu1::ui_ini_write("SRScale",    scale);
+                mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+            };
+
+            ImGui::SeparatorText("SECOND GPU");
+            if (ImGui::Checkbox("Enable DLSS on GPU 1", &m_sr))
+            {
+                mgpu::gpu1::ui_ini_write("SRUpscale", m_sr ? 1 : 0);
+                // Turning it on must leave a usable R behind even when the
+                // ini came from 0.1.0 and has SRScale=0 in it.
+                if (m_sr) write_mode(m_mode);
+            }
+            ImGui::TextDisabled("Neural rendering runs at a reduced size, DLSS enlarges it back.");
+            ImGui::TextDisabled("Works whatever the game's own DLSS is set to, including off.");
+
+            if (m_sr)
+            {
+                ImGui::TextUnformatted("preset");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("title default##p", m_preset == 0))
+                { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("K##p", m_preset == 11))
+                { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("L##p", m_preset == 12))
+                { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("M##p", m_preset == 13))
+                { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
+                ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
+
+                ImGui::TextUnformatted("mode  ");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("quality##m", m_mode == 2))
+                { m_mode = 2; write_mode(2); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("balanced##m", m_mode == 1))
+                { m_mode = 1; write_mode(1); }
+                ImGui::SameLine();
+                if (ImGui::RadioButton("performance##m", m_mode == 0))
+                { m_mode = 0; write_mode(0); }
+                ImGui::TextDisabled("Sets the size neural rendering runs at, the way DLSS does:");
+                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+
+                // THE NOTICE. Measured once, on one title, on one rig - and
+                // the honest version of that is not silence.
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "If you see ghosting or smearing in motion, turn this off.");
+                ImGui::TextDisabled("Reducing the frame and enlarging it back is newer than the");
+                ImGui::TextDisabled("rest of the bridge. It has been clean here and nobody has");
+                ImGui::TextDisabled("ruled out that it ghosts on other games or other hardware.");
+            }
+
+            // ---- V26: THERE IS NO "DLAA MODE" ANY MORE, AND THAT IS THE FIX ----
+            //
+            // V24 removed the DLAA toggle on the grounds that SRScale=50 plus
+            // SRMvLowRes=1 was the only panel setting that had ever produced
+            // FAIL_PlatformError, and that the V42 guard fixing it had never
+            // completed a run. BOTH HALVES OF THAT WERE STALE.
+            //
+            // The FAIL_PlatformError had one cause - the old guard forcing
+            // MVLowRes on with no MV_Scale correction when the vectors were at
+            // the display extent - and V42 fixed it. The guard is not unproven
+            // either: it took the correct branch on Dawnwalker on 2026-09-13,
+            // and a full 6000-frame run at SRScale=50 arrived at
+            // "CreateFeature(SuperSampling) Success | R=1280x720 -> D=2560x1440,
+            // MVLowRes=1, MVScale fix 0.5000/0.5000" with zero ghosting at
+            // 42 fps on GPU 0 - which is the HARD case for ghosting, not the
+            // easy one. Every DLAA attempt that failed before that died in
+            // CreateFeature(Reserved18), which was the unrelated cubin crash.
+            //
+            // So DLAA does not come back as a toggle, because it was never a
+            // mode. It was the state of having no R of our own. The mode
+            // buttons above now choose R on every title, so the controls mean
+            // the same thing whatever the game's DLSS is set to, and the thing
+            // that used to need a second confusing switch is just the default.
+            //
+            // FORCE REFLEX stays out, and the reason is a one-way door. The
+            // driver mode is PER DEVICE and survives the process, so a launch
+            // that crashes leaves GPU 0 in low latency with nothing to undo
+            // it - restore() only ever runs from stream_shutdown(), and all
+            // three of its call sites are clean-exit paths. Worse still,
+            // restore() is gated on `applied`, which is only set when
+            // Reflex=1 engaged, so a user who ticks this, crashes, and then
+            // UNTICKS IT to be safe has made the residue permanent. A toggle
+            // whose off position cannot undo its on position is a trap, and
+            // it is not shipping in a panel.
+            //
+            // The Reflex key still exists in mgpu.ini for our own testing. It
+            // is simply not one click away for someone who has no idea what it
+            // does. When the residue is self-healing it can come back.
+            //
+            // ---- ONE RULE, AND IT IS NEVER WRONG ----
+            //
+            // Everything left in this panel is read AT ARM, so arming is
+            // technically enough for it. The panel still says RESTART, because
+            // one rule that is sometimes stronger than needed beats two rules
+            // where the reader has to work out which one applies. "Applied
+            // when you arm" is not a sentence a non-native reader should have
+            // to decode to find out whether their setting took.
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Saved automatically. RESTART THE GAME to use these settings.");
+            ImGui::TextDisabled("The file is mgpu.ini, next to the game's exe.");
+
+            ImGui::Spacing();
+            if (ImGui::Button("  START NOW  ")) mgpu::gpu1::ui_request_arm();
+            ImGui::SameLine();
+            ImGui::TextDisabled("starts the bridge with the settings already saved");
+        }
+        else
+        {
+        // NOT a return above: this block sits inside BeginChild, and returning
+        // from here would skip EndChild and leave ImGui's stack unbalanced for
+        // the rest of the frame. An else costs one brace and cannot do that.
+        ImGui::SeparatorText("Super resolution");
+        if (!st.sr_requested)
+        {
+            ImGui::TextDisabled("Off. SRUpscale=1 in mgpu.ini turns it on.");
+        }
+        else if (!st.sr_on)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Requested but not running - see [MGPU][C2-SR] in the log.");
+            ImGui::TextDisabled("The usual reason is that the game already renders at display resolution.");
+        }
+        else
+        {
+            snprintf(dl, sizeof dl, "%ux%u  ->  %ux%u   (%.2f Mpx -> %.2f Mpx)",
+                     st.sr_w, st.sr_h, st.out_w, st.out_h,
+                     (double)st.sr_w * (double)st.sr_h / 1000000.0,
+                     (double)st.out_w * (double)st.out_h / 1000000.0);
+            ImGui::TextUnformatted(dl);
+
+            static const char *qn[] = { "Max Perf", "Balanced", "Max Quality",
+                                        "Ultra Perf", "Ultra Quality", "DLAA" };
+            const int qi = (st.sr_quality >= 0 && st.sr_quality < 6) ? st.sr_quality : 1;
+            snprintf(dl, sizeof dl, "quality %s   preset %s   R %s",
+                     qn[qi],
+                     (st.sr_preset == 0) ? "title default" : "forced",
+                     (st.sr_scale_pct == 0) ? "inherited from the game"
+                                            : "chosen by SRScale");
+            ImGui::TextUnformatted(dl);
+
+            snprintf(dl, sizeof dl, "snippet  %s%s",
+                     st.sr_snippet_driver ? "DRIVER's copy" : "the game's own copy",
+                     (st.sr_snippet_requested && !st.sr_snippet_driver)
+                         ? "  (driver copy asked for but not found)" : "");
+            ImGui::TextUnformatted(dl);
+            if (!st.sr_snippet_driver)
+                ImGui::TextDisabled("Preset availability is whatever that DLL carries - an old one lacks K.");
+
+            snprintf(dl, sizeof dl, "motion vectors  mode %u, flag %s, MV scale x%.4f/%.4f",
+                     st.sr_mv_mode, st.sr_mv_lowres ? "ON" : "off",
+                     st.sr_mv_fix_x, st.sr_mv_fix_y);
+            ImGui::TextUnformatted(dl);
+            if (st.sr_mv_mode == 1)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "EXPERIMENTAL. May reduce ghosting - or cause it. Not confirmed on any other rig or game.");
+            else if (st.sr_mv_mode == 2)
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                                   "Mode 2 derives the flag WITHOUT correcting the scale - this is the combination that ghosted.");
+        }
+
+        ImGui::SeparatorText("Reflex");
+        {
+            const char *w = (st.reflex_was < 0) ? "unknown" : (st.reflex_was ? "ON" : "OFF");
+            const char *n = (st.reflex_now < 0) ? "unknown" : (st.reflex_now ? "ON" : "OFF");
+            if (st.reflex_was < 0 && !st.reflex_applied)
+            {
+                ImGui::TextDisabled("Not engaged. Reflex=1 in mgpu.ini sets the driver's low-latency mode on GPU 0.");
+            }
+            else
+            {
+                snprintf(dl, sizeof dl, "SetSleepMode %s   |   driver reported  before %s   after %s",
+                         st.reflex_applied ? "accepted" : "REJECTED", w, n);
+                ImGui::TextUnformatted(dl);
+                ImGui::TextDisabled("The reported state is unreliable: it has read OFF after a write that plainly worked.");
+                ImGui::TextDisabled("Judge it by the GPU 0 queue above - near 1.0 is the result, not this line.");
+                if (st.reflex_was == 1)
+                    ImGui::TextDisabled("The title already had it on, so this run says nothing about the mechanism.");
+            }
+        }
+
+        // ---- V12: THE CONTROLS. STAGE AND COMMIT. ----
+        //
+        // Quality and preset are baked into the NGX feature handle when it is
+        // created, so neither can be a live slider: changing one means
+        // releasing that handle and building a new one. So the radio buttons
+        // stage a choice and APPLY commits it - the rebuild happens at the top
+        // of the next poll on the bridge thread, which is the only moment GPU 1
+        // has nothing outstanding.
+        //
+        // R DOES NOT CHANGE with either value, so nothing R-sized is rebuilt:
+        // not the transport, not the ring, not the neural stage. That is
+        // exactly why these two are safe to expose and why the DLAA lever
+        // below is not.
+        if (st.sr_on)
+        {
+            ImGui::SeparatorText("Change quality or preset");
+            // SAY IT BEFORE THE BUTTONS, NOT AFTER. These radios STAGE a
+            // choice; nothing happens until APPLY. The first person to use
+            // this panel clicked a preset, saw no change, and reasonably
+            // concluded the control was broken.
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Pick, then press APPLY. The buttons alone change nothing.");
+
+            static int  want_q = -1, want_p = -1;
+            static bool init_done = false;
+            if (!init_done) { want_q = st.sr_quality; want_p = st.sr_preset; init_done = true; }
+
+            ImGui::TextUnformatted("Quality");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("quality", want_q == 2))     want_q = 2;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("balanced", want_q == 1))    want_q = 1;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("performance", want_q == 0)) want_q = 0;
+            // V18. THE MODE NOW SETS R, WHICH IS WHAT MAKES IT MEAN ANYTHING.
+            // Without this the buttons changed only the model's internal mode
+            // against an R inherited from the game, and looked broken because
+            // nothing on screen moved. Same ladder the inner loop uses.
+            ImGui::TextDisabled("Sets R as a share of the display, the way DLSS does:");
+            ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%%.");
+
+            ImGui::TextUnformatted("Preset");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("title default", want_p == 0)) want_p = 0;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("K", want_p == 11)) want_p = 11;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("L", want_p == 12)) want_p = 12;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("M", want_p == 13)) want_p = 13;
+            ImGui::TextDisabled("A DLL that lacks the preset asked for silently uses its own.");
+            ImGui::TextDisabled("Its nvngx_dlss_*.log says which one it HONOURED. That is the answer.");
+
+            const bool dirty = (want_q != st.sr_quality) || (want_p != st.sr_preset);
+            ImGui::Separator();
+            if (st.sr_rebuild_pending)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "Applying on the next frame...");
+            }
+            else if (dirty)
+            {
+                // Loud, and immediately under the thing that staged it.
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "STAGED - NOT APPLIED YET");
+                if (ImGui::Button("  APPLY  "))
+                {
+                    const int scale = (want_q == 2) ? 67 : ((want_q == 1) ? 58 : 50);
+                    mgpu::gpu1::ui_set_sr_request(want_q, want_p, scale);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("cancel")) { want_q = st.sr_quality; want_p = st.sr_preset; }
+                ImGui::TextDisabled("One long frame, about 30-40 ms. Figures before and after");
+                ImGui::TextDisabled("are different pipelines - do not pool them.");
+            }
+            else
+            {
+                ImGui::TextDisabled("No change staged - the panel matches what is running.");
+            }
+
+            if (st.sr_rebuild_count != 0)
+            {
+                snprintf(dl, sizeof dl, "%u rebuild%s this run, last one %s",
+                         st.sr_rebuild_count, (st.sr_rebuild_count == 1) ? "" : "s",
+                         (st.sr_rebuild_last_ok == 1) ? "OK" : "FAILED");
+                if (st.sr_rebuild_last_ok == 1) ImGui::TextUnformatted(dl);
+                else ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "%s", dl);
+            }
+        }
+
+        // ---- AUTO: the inner loop ----
+        //
+        // NOT A QUALITY SHORTCUT. Auto sizes R so GPU 1's evaluate finishes
+        // inside the frame budget, measured on this card in this scene, and
+        // re-decides as the scene moves. It is the calibrator for the case the
+        // fixed modes cannot cover: a card where the mode you picked does not
+        // fit, or a producer running far enough ahead that it never did.
+        ImGui::SeparatorText("Auto - size the work to the frame budget");
+        if (st.auto_on)
+        {
+            snprintf(dl, sizeof dl, "ON, target %u fps (%.2f ms budget)",
+                     st.auto_target_fps, st.auto_budget_ms);
+            ImGui::TextUnformatted(dl);
+            snprintf(dl, sizeof dl, "rung %u of %u   |   %u change%s so far",
+                     st.auto_rung + 1u, st.auto_rungs, st.auto_changes,
+                     (st.auto_changes == 1) ? "" : "s");
+            ImGui::TextUnformatted(dl);
+            if (st.auto_last_mean > 0.0)
+            {
+                snprintf(dl, sizeof dl, "last window: evaluate %.2f ms against %.2f ms usable",
+                         st.auto_last_mean, st.auto_budget_ms * 0.85);
+                ImGui::TextUnformatted(dl);
+            }
+            ImGui::TextDisabled("%s", "Steps down above 105% of budget, up below 80%, then holds");
+            ImGui::TextDisabled("600 frames. That gap is what stops it oscillating.");
+        }
+        else
+        {
+            ImGui::TextDisabled("Off. Auto=1 and AutoTargetFps in mgpu.ini.");
+            ImGui::TextDisabled("Needs SRUpscale - it works by moving R, which only exists");
+            ImGui::TextDisabled("when super resolution is running.");
+        }
+
+        // ---- Settings: writes the file, takes effect next launch ----
+        //
+        // THIS CANNOT BE LIVE, and pretending otherwise would be the worse
+        // option. SRUpscale is read at arm, and by the time this view is on
+        // screen the arm has already happened. So the panel edits mgpu.ini
+        // and says plainly that the next launch is when it matters.
+        //
+        // V24: no longer headed "Experimental". The two experimental things
+        // in it are gone and the only control left is the one the box above
+        // reports on, so the old heading now warns about nothing.
+        ImGui::SeparatorText("Settings - restart to take effect");
+        {
+            // V24. Reflex and DLAA were here too - this is the ARMED view's
+            // copy of the same two controls the pre-arm menu had. Removing
+            // them from one place and leaving them in the other would be the
+            // worst of both: the trap still reachable, and now reachable only
+            // from the screen a user gets to AFTER something has gone right,
+            // which is the least likely place for anyone to look for it.
+            // Both go. The reasoning is written out in full at the pre-arm
+            // block above and is not repeated here.
+            static bool ini_loaded = false;
+            static bool want_sr = false;
+            if (!ini_loaded)
+            {
+                ini_loaded   = true;
+                want_sr      = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
+            }
+
+            // Latched, not per-frame. The click lasts one frame and the
+            // message has to outlive it or nobody ever sees it.
+            static bool wrote_any = false;
+
+            // SUPER RESOLUTION ITSELF, AND IT GOES FIRST BECAUSE IT GATES THE
+            // REST. With the shipped mgpu.ini, SRUpscale is absent and
+            // defaults to 0, so the whole box above read "Off - set it in
+            // mgpu.ini" and there was no way to turn it on from here at all.
+            // A panel that can only report a feature nobody can reach is not a
+            // panel. Arm-time key, so it is a restart like the others.
+            if (ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr))
+            {
+                wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
+            }
+            ImGui::TextDisabled("Neural rendering runs at R, then DLSS enlarges it back to");
+            ImGui::TextDisabled("the display. Everything else in this box needs it on.");
+
+            ImGui::Spacing();
+            if (wrote_any)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "mgpu.ini written. RESTART THE GAME - this session is unchanged.");
+            else
+                ImGui::TextDisabled("Changes here edit mgpu.ini. The running session never changes.");
+        }
+        }   // ---- end of the armed view ----
+    }
+    ImGui::EndChild();   // ---- end BOX 2 ----
+
+    // ---- P9.1: the lateral acquisition probe ----
+    //
+    // Drawn on the GAME runtime as well as the bridge one, which is what makes
+    // the toggle safe: register_event and unregister_event are called from the
+    // render thread of the runtime being drawn, never from the bridge thread.
+    ImGui::SeparatorText("Probe (P9.1) - acquisition lateral");
+    {
+        mgpu::probe::readout pr;
+        mgpu::probe::read(pr);
+
+        int pm = (int)pr.m;
+        ImGui::TextUnformatted("Mode");
+        ImGui::SameLine();
+        bool changed = false;
+        changed |= ImGui::RadioButton("off",   &pm, 0); ImGui::SameLine();
+        changed |= ImGui::RadioButton("depth", &pm, 1); ImGui::SameLine();
+        changed |= ImGui::RadioButton("mvec",  &pm, 2); ImGui::SameLine();
+        changed |= ImGui::RadioButton("both",  &pm, 3);
+        if (changed) mgpu::probe::set_mode((mgpu::probe::mode)pm);
+
+        if (pm != 0)
+        {
+            char pb[320];
+            snprintf(pb, sizeof pb,
+                     "game device %s | %llu resources examined | %llu frames",
+                     pr.game_device_found ? "found" : "NOT FOUND",
+                     pr.examined, pr.frames);
+            ImGui::TextUnformatted(pb);
+
+            snprintf(pb, sizeof pb, "cost: depth %.0f ns/frame, mvec %.0f ns/frame",
+                     pr.depth_ns_per_frame, pr.mvec_ns_per_frame);
+            ImGui::TextUnformatted(pb);
+
+            for (unsigned i = 0; i < pr.depth_n && i < 4; ++i)
+            {
+                snprintf(pb, sizeof pb, "depth #%u  %ux%u  binds=%llu clears=%llu", i,
+                         pr.depth_top[i].width, pr.depth_top[i].height,
+                         pr.depth_top[i].binds, pr.depth_top[i].clears);
+                ImGui::TextUnformatted(pb);
+            }
+            for (unsigned i = 0; i < pr.mvec_n && i < 4; ++i)
+            {
+                snprintf(pb, sizeof pb, "mvec  #%u  %ux%u  srvs=%llu", i,
+                         pr.mvec_top[i].width, pr.mvec_top[i].height,
+                         pr.mvec_top[i].binds);
+                ImGui::TextUnformatted(pb);
+            }
+            ImGui::TextDisabled("Watching only. Nothing is bound, nothing crosses the bus.");
+        }
+    }
+
     ImGui::Separator();
     ImGui::TextDisabled("Do not change resolution, DLSS mode or presets while armed - disarm first.");
     ImGui::TextDisabled("Frame generation is untested. Changes here make this a tuning run.");
+
+    // ---- V20: WHERE TO SEND A LOG ----
+    //
+    // NOT PROMOTION - THE PROJECT NEEDS OTHER PEOPLE'S LOGS. Two findings are
+    // explicitly blocked on "needs more machines": an intermittent crash at
+    // arm that has never reproduced on demand, and whether the corrected
+    // motion-vector flag ghosts anywhere other than the one rig it was judged
+    // on. A user who crashes and sees nothing has no idea a repo exists. A
+    // user who crashes and sees this line becomes a data point.
+    //
+    // Plain copyable text on purpose. Nothing here opens a browser from inside
+    // somebody's game, and the path to the log is spelled out because the
+    // person reading it has just had something go wrong and should not have to
+    // go hunting.
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // ---- V25: THE INSTALL LAYOUT, AND IT SITS WITH THE BUG-REPORT LINE ----
+    //
+    // These two belong together. One says where to send a log when something
+    // breaks; this one says what is most likely to be breaking. A file in the
+    // wrong folder is not a cosmetic problem here - it is THE crash, proven
+    // 2026-09-13: with nvngx_dlssnr.dll beside the executable, the title's own
+    // Streamline loads it and binds NGX to the GAME'S GPU a second and a half
+    // before this add-on's thread exists, and the neural stage then faults
+    // inside NVIDIA's allocator and takes the process down.
+    //
+    // Cyberpunk never wanted that DLL. Our own 0.1.0 install instructions put
+    // it there, so anyone upgrading is in the broken state by default and has
+    // no way to know it. That is exactly the case a panel exists to catch.
+    //
+    // Coloured rather than TextDisabled when wrong: this is the one line in
+    // this panel worth interrupting someone for.
+    {
+        const int layout = mgpu::gpu1::ui_install_layout();
+        if (layout == 1)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.30f, 1.0f),
+                               "INSTALL PROBLEM - the neural stage will crash this game.");
+            ImGui::TextUnformatted("nvngx_dlssnr.dll is next to the game's exe. The game loads it");
+            ImGui::TextUnformatted("there and claims the wrong GPU before this add-on starts.");
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "MOVE it into the mgpu folder next to the add-on, then restart.");
+        }
+        else if (layout == 2)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "nvngx_dlssnr.dll not found - neural rendering cannot start.");
+            ImGui::TextUnformatted("Put it in the mgpu folder next to the add-on, then restart.");
+        }
+        else
+        {
+            ImGui::TextDisabled("Install layout OK - nvngx_dlssnr.dll is in its own folder.");
+        }
+        ImGui::Spacing();
+    }
+
+    ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
+    ImGui::TextDisabled("github.com/maohgad-web/Neural-coprocessor");
 }
 #endif
 
@@ -417,6 +1192,19 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 // file keeps its rule of holding no ReShade types - it takes the two native
 // pointers and nothing else. get_native() returns uint64_t, not a pointer,
 // so these are reinterpret_cast and not static_cast (P0_RECORD section 09).
+// L3. Fired after ReShade has submitted the effects list for this frame and
+// before the swapchain presents it - which is exactly the ordering the
+// next-frame signal in stream_on_finish_effects was working around.
+static void on_present(reshade::api::command_queue *queue,
+                       reshade::api::swapchain *,
+                       const reshade::api::rect *, const reshade::api::rect *,
+                       uint32_t, const reshade::api::rect *)
+{
+    if (queue == nullptr) return;
+    mgpu::gpu1::stream_on_present(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(queue->get_native())));
+}
+
 static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                                       reshade::api::command_list *cmd_list,
                                       reshade::api::resource_view rtv,
@@ -426,6 +1214,12 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
     if (runtime == nullptr || cmd_list == nullptr) return;
 
     reshade::api::device *dev = runtime->get_device();
+
+    // P12.2/R63. Hoisted, because the depth barrier below is only legal on the
+    // GAME runtime's command list while the stream call sits outside the block
+    // that knows which runtime this is. Issuing a transition for a GPU 0
+    // resource on the bridge runtime's GPU 1 list is not a subtle error.
+    bool rt_is_game = false;
     if (dev == nullptr) return;
 
     // P1.6. Which runtime is this? The same LUID comparison on_destroy_device
@@ -448,6 +1242,42 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                                       luid.HighPart == sel.game_luid.HighPart);
                 log_preset_once(runtime, is_game ? "GAME" : "BRIDGE",
                                 is_game ? game_probe : bridge_probe);
+                // P9.1. The probe's frame tick and its periodic dump. Placed
+                // here because this is the one spot that already knows which
+                // runtime it is on, and the probe counts the GAME's frames -
+                // the bridge runtime presents on its own schedule and counting
+                // both would make the ns/frame figure meaningless.
+                // P11.0 (R48). note_effects FIRST: it only stores the
+                // runtime pointer, and dump() - which note_frame may call on
+                // this very line - is what enumerates through it. Reversed,
+                // the first dump of the process would have no runtime and the
+                // semantic lane would report NOT RUN for one window.
+                if (is_game)
+                {
+                    rt_is_game = true;
+                    mgpu::probe::note_effects(runtime, cmd_list);
+                    mgpu::probe::note_frame();
+                    // R101. Same tick, same runtime, same reason: the tap's
+                    // ns/frame figure has to be against the GAME's frames.
+                    mgpu::calibrator::note_frame();
+
+                    // ---- R103: HAND THE TRANSPORT THE GAME'S OWN HANDLE ----
+                    //
+                    // Only when the calibrator actually has one. read()
+                    // returns false until something has been captured, and
+                    // KEY_MVEC is only set when the Get succeeded, so a title
+                    // where the calibrator never resolved falls through to the
+                    // barrier probe's pick with no branch of its own.
+                    //
+                    // Calib=0 is the off switch: no calibrator, no table, no
+                    // override, and this build behaves exactly like R99.
+                    {
+                        mgpu::calibrator::table ct;
+                        if (mgpu::calibrator::read(ct) &&
+                            (ct.have & mgpu::calibrator::KEY_MVEC) != 0u)
+                            mgpu::probe::set_mvec_override(ct.mvec);
+                    }
+                }
             }
         }
     }
@@ -477,10 +1307,53 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
 
     // P4.0 rides the same event. Both paths are inert until requested and are
     // independent by construction, so neither can leave the other half-armed.
+    //
+    // ---- R63: THE DEPTH TRANSITION IS ISSUED HERE, NOT IN gpu1_context ----
+    //
+    // Two reasons, and the second is the real one.
+    //
+    // 1. gpu1_context holds no ReShade types, by a design rule older than this
+    //    milestone, and ReShade's barrier is a ReShade type.
+    // 2. R56 proved that RESHADE'S OWN MAPPING of shader_resource is the
+    //    correct transition for a resource ReShade owns - 1080 copies, no
+    //    device loss, on a rig with no debug layer to catch a wrong one.
+    //    P10.3 already spent a device guessing a raw D3D12 state for a
+    //    resource this project did not create. This does not guess.
+    //
+    // The colour copy inside stream_on_finish_effects transitions the game's
+    // own back buffer and stays raw D3D12. The two are different cases and are
+    // deliberately not written the same way.
+    //
+    // Barrier, record, barrier back - all on one list, in order. A handle of 0
+    // means ReShade has no depth this frame, and then nothing at all is issued.
+    unsigned long long depth_h = rt_is_game ? mgpu::probe::depth_source() : 0ull;
+    const reshade::api::resource depth_res = { depth_h };
+
+    if (depth_h != 0)
+        cmd_list->barrier(depth_res, reshade::api::resource_usage::shader_resource,
+                                     reshade::api::resource_usage::copy_source);
+
+    // ---- R78: the velocity buffer, for the ARM ONLY ----
+    //
+    // No barrier and no copy here, and that is the difference from depth. By
+    // the time this event fires the velocity target has been bound as a render
+    // target again and holds whatever the engine last drew into it - the frame
+    // it described is gone. Its per-frame copy is issued mid-frame from
+    // mgpu_mvec_transport_hook above; all this handle does is let the arm size
+    // the slot's MVec region from the real resource. Zero until the probe has
+    // published one, which holds the arm - see stream_on_finish_effects.
+    const unsigned long long mvec_h = rt_is_game ? mgpu::probe::mvec_source() : 0ull;
+
     mgpu::gpu1::stream_on_finish_effects(
         reinterpret_cast<void *>(static_cast<uintptr_t>(cmd_list->get_native())),
         q_native,
-        static_cast<unsigned long long>(res.handle));
+        static_cast<unsigned long long>(res.handle),
+        depth_h,
+        mvec_h);
+
+    if (depth_h != 0)
+        cmd_list->barrier(depth_res, reshade::api::resource_usage::copy_source,
+                                     reshade::api::resource_usage::shader_resource);
 }
 
 // T3 instrumentation: in a clean run, no destroy_device with the game's
@@ -506,6 +1379,27 @@ static void on_destroy_device(reshade::api::device *device)
             {
                 mgpu::diag::info("[MGPU][T3] game device released - signaling bridge thread "
                                  "teardown (final log lines are best effort)");
+
+                // ---- V17: CLOSE THE NGX SESSION HERE TOO ----
+                //
+                // stream_shutdown() already runs in the bridge thread's
+                // ordered teardown. That teardown only happens if the bridge
+                // loop unwinds cleanly, and NOT closing the NGX session is the
+                // fault that poisons the NEXT LAUNCH of the game - five clean
+                // launches followed by one crash is what a cleanup that
+                // usually runs looks like.
+                //
+                // This event is the earliest and most reliable notice we get
+                // that the game's device is going. Calling here means the
+                // session is closed on paths where the bridge thread never
+                // gets to its teardown at all.
+                //
+                // SAFE TO CALL TWICE: stream_shutdown clears the pointers it
+                // uses and returns early when there is nothing left, so the
+                // ordered teardown finding it already done is the normal case
+                // rather than an error.
+                mgpu::gpu1::stream_shutdown();
+
                 mgpu::worker::stop();
             }
         }
@@ -547,6 +1441,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // subscription that acts on the game's own command list.
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(
             on_reshade_finish_effects);
+        // L3: see stream_on_present. Registered unconditionally; the add-on
+        // side decides whether to act on it, so the ini can turn the behaviour
+        // on and off without a rebuild.
+        reshade::register_event<reshade::addon_event::present>(on_present);
+        // P9.1. NOT initialised here. The probe reads mgpu.ini, and file I/O
+        // inside DllMain runs under the loader lock, where the CRT is entitled
+        // to load a locale DLL and deadlock against the lock we are already
+        // holding. It is initialised from on_init_swapchain instead, which is
+        // on the game's render thread with the loader lock long released - the
+        // same thread the probe's own register_event calls belong on anyway.
 #if defined(MGPU_HAVE_IMGUI)
         reshade::register_overlay("MGPU Bridge", draw_mgpu_overlay);
         reshade::log::message(reshade::log::level::info,
@@ -586,11 +1490,47 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         //   reshade_unload event to drive the teardown from earlier, so if
         //   the FreeLibrary happens first the GPU 1 device is simply leaked
         //   - explicitly in scope at P0. A hang is not.
-        (void)lpReserved;
+        // ---- V21: CLOSE THE NGX SESSION HERE TOO. LAST RESORT AND IT IS NEEDED. ----
+        //
+        // Measured 2026-09-13 on a CLEAN exit: ReShade goes
+        //     Destroyed runtime environment -> Unregistered add-on -> Exiting
+        // and NEVER RAISES destroy_device. So both of the other call sites -
+        // on_destroy_device and the bridge thread's ordered teardown - are
+        // hooked to events that did not happen, the NGX session stayed open,
+        // and the NEXT launch of the game paid for it. That is the "open it
+        // twice and it fixes itself" symptom.
+        //
+        // ONLY ON THE FreeLibrary PATH. lpReserved == NULL means ReShade is
+        // unloading us while the process lives, which is when the device is
+        // still valid and there is something to close. lpReserved != NULL is
+        // process termination: every other thread is already dead, and calling
+        // into a vendor DLL there is how DllMain rules get broken.
+        //
+        // Still under the loader lock, which is why this is the LAST of three
+        // call sites rather than the first, and why stream_shutdown announces
+        // every vendor call before making it. If the process dies here, the
+        // log names which one.
+        if (lpReserved == nullptr)
+        {
+            mgpu::diag::info("[MGPU][T3] FreeLibrary unload - closing the NGX session from "
+                             "DllMain, because ReShade does not always raise destroy_device "
+                             "and an unclosed session poisons the next launch.");
+            mgpu::gpu1::stream_shutdown();
+        }
 #if defined(MGPU_HAVE_IMGUI)
         reshade::unregister_overlay("MGPU Bridge", draw_mgpu_overlay);
 #endif
+        // P9.1 before worker::stop: unregistering our events while the game
+        // thread may still raise them is the one ordering that matters here,
+        // and DllMain is single-threaded with respect to ReShade's dispatch.
+        mgpu::probe::shutdown();
         mgpu::worker::stop();
+        // R101c: PUT THE IMPORT SLOTS BACK BEFORE THIS DLL GOES AWAY.
+        // ~150 modules hold pointers into this image. Unloading without
+        // restoring them leaves every one of those slots aimed at unmapped
+        // memory, and the next GetProcAddress anywhere in the process walks
+        // into it. This is what stopped Dragon Sword launching.
+        mgpu::calibrator::uninstall();
         reshade::unregister_addon(hModule);
         break;
     }

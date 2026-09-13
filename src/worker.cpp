@@ -574,8 +574,46 @@ namespace
                 // appears, and the game's borderless-fullscreen presentation
                 // drops to windowed-with-borders with the taskbar showing.
                 // The window is shown without activation below.
+                // ---- V18: NoActivate. EXPERIMENTAL, OFF BY DEFAULT. ----
+                //
+                // The window is already created hidden and shown with
+                // SW_SHOWNOACTIVATE, so it does not steal foreground when it
+                // APPEARS. But its extended style is 0, which means a CLICK on
+                // it activates it and takes foreground from the game - and a
+                // game that is not foreground stops taking input, pad included.
+                //
+                // WS_EX_NOACTIVATE makes the window refuse activation
+                // altogether: clicks do not bring it forward and the game keeps
+                // the foreground, so keyboard, mouse and XInput keep working
+                // while the bridge output is on screen.
+                //
+                // WS_EX_TOOLWINDOW goes with it to keep the window out of
+                // Alt+Tab, for the same reason - an Alt+Tab that lands on the
+                // bridge window is the same lost foreground by another route.
+                //
+                // AUTO BY DEFAULT, and only in DUPLICATE mode. The style only
+                // matters when the bridge output shares a picture with the game -
+                // in extended mode the two are on different screens and taking
+                // foreground is normal, wanted behaviour. window_no_activate()
+                // decides: NoActivate=0 off, 1 always, 2 auto (the default),
+                // where auto asks QueryDisplayConfig whether one display source
+                // is driving two targets.
+                DWORD ex_style = 0;
+                if (mgpu::gpu1::window_no_activate())
+                {
+                    ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                    mgpu::diag::info("[MGPU][T4] the bridge window is created "
+                                     "WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW. It will not take "
+                                     "foreground from the game when clicked and will not appear "
+                                     "in Alt+Tab, so the game keeps keyboard, mouse and pad. "
+                                     "The line above says whether this was forced or detected. "
+                                     "TRADEOFF: the ReShade overlay on THIS window needs focus "
+                                     "to take keyboard, so use the GAME's overlay instead - it "
+                                     "is the same panel.");
+                }
+
                 hwnd = CreateWindowExW(
-                    0,
+                    ex_style,
                     class_name_w,
                     L"MGPU Bridge (GPU 1) - starting | D3D12 only",
                     wnd_style,
@@ -970,6 +1008,86 @@ namespace
                 const float cg = 0.5f + 0.5f * std::sin(ph + TAU / 3.0f);
                 const float cb = 0.5f + 0.5f * std::sin(ph + 2.0f * TAU / 3.0f);
 
+                // ---- P7.10: AutoArm. MOVED HERE 2026-09-12. ----
+                //
+                // IT USED TO SIT AFTER present_frame, AND THAT IS WHY IT
+                // CRASHED. AutoArm=1 died at arm on V21, V22 and V23 while
+                // arming BY HAND worked on the same builds, in the same
+                // session, with the same ini; Reflex=0 made no difference, so
+                // the two arms differ by WHERE they happen, not by what they
+                // do.
+                //
+                // The hotkey arms from the message pump above - before
+                // stream_poll, before the present gate, before present_frame.
+                // AutoArm armed after present_frame, in the tail of the
+                // iteration, while claiming in its own log line to be
+                // "identical to pressing CTRL+ALT+F10". It was not identical
+                // and the log said it was, which is the worst combination:
+                // stream_request() creates the NGX features by resetting
+                // s.na/s.nl - the SAME single allocator and list the per-frame
+                // consume path records into - so the safe moment to arm is the
+                // one the hotkey uses, at the top of an iteration, and not the
+                // one immediately behind a present.
+                //
+                // Also evaluated on EVERY iteration now rather than only on
+                // ones that got past the present gate. The gate returns false
+                // whenever nothing new has arrived, which is most iterations
+                // while the game is still loading - exactly the window AutoArm
+                // is counting through.
+                // V19. THE PANEL ARMS, AND HOLDS AUTOARM WHILE IT IS OPEN.
+                // Taken before the AutoArm block so a manual arm always wins.
+                if (mgpu::gpu1::ui_take_arm_request())
+                {
+                    autoarm_done = true;   // manual arm stands down the timer
+                    mgpu::diag::info("[MGPU][P7.10] ARM NOW pressed in the panel. Settings are "
+                                     "read from mgpu.ini at this moment, so anything changed in "
+                                     "the panel before now applies to THIS session.");
+                    mgpu::gpu1::stream_request();
+                }
+
+                if (!autoarm_done && frame >= autoarm_at &&
+                    !mgpu::gpu1::ui_panel_is_open())
+                {
+                    const unsigned long long quiet =
+                        mgpu::adapter::ms_since_last_swapchain_event();
+                    if (quiet >= AUTOARM_QUIET_MS)
+                    {
+                        mgpu::gpu1::ui_state ast;
+                        mgpu::gpu1::ui_read(ast);
+                        if (ast.armed)
+                        {
+                            // Armed by hand while we were waiting. Stand down
+                            // silently rather than arming a second time.
+                            autoarm_done = true;
+                        }
+                        else
+                        {
+                            autoarm_done = true;
+                            snprintf(line, sizeof line,
+                                     "[MGPU][P7.10] AutoArm firing at frame %llu (%llu ms since "
+                                     "the last swapchain event), from the same point in the loop "
+                                     "the hotkey arms from. If the game is still in a menu the "
+                                     "stream is armed against menu frames, which is correct but "
+                                     "measures nothing.",
+                                     (unsigned long long)frame, quiet);
+                            mgpu::diag::info(line);
+                            mgpu::gpu1::stream_request();
+                        }
+                    }
+                    else if (!autoarm_waiting_logged)
+                    {
+                        autoarm_waiting_logged = true;
+                        snprintf(line, sizeof line,
+                                 "[MGPU][P7.10] AutoArm reached its frame count at %llu but the "
+                                 "game's swapchain changed %llu ms ago - waiting for %llu ms of "
+                                 "quiet. Arming across a swapchain rebuild is what produces a "
+                                 "session-long run of DROPPED and REORDERED seals.",
+                                 (unsigned long long)frame, quiet,
+                                 (unsigned long long)AUTOARM_QUIET_MS);
+                        mgpu::diag::info(line);
+                    }
+                }
+
                 // P5.1. Poll first, then decide whether there is anything worth
                 // presenting. When the stream is running this paces the loop to
                 // NEW neural frames instead of to vsync; when it is idle the
@@ -1013,52 +1131,6 @@ namespace
                 // that owns the window, which is this one.
                 if (frame == 1 || frame % 30 == 0)
                     set_window_title(hwnd, frame);
-
-                // P7.10: AutoArm, evaluated here so it can see the frame count
-                // this loop maintains. Both conditions, then one attempt, then
-                // never again - a retry loop around arming is a retry loop
-                // around a one-shot.
-                if (!autoarm_done && frame >= autoarm_at)
-                {
-                    const unsigned long long quiet =
-                        mgpu::adapter::ms_since_last_swapchain_event();
-                    if (quiet >= AUTOARM_QUIET_MS)
-                    {
-                        mgpu::gpu1::ui_state ast;
-                        mgpu::gpu1::ui_read(ast);
-                        if (ast.armed)
-                        {
-                            // Armed by hand while we were waiting. Stand down
-                            // silently rather than arming a second time.
-                            autoarm_done = true;
-                        }
-                        else
-                        {
-                            autoarm_done = true;
-                            snprintf(line, sizeof line,
-                                     "[MGPU][P7.10] AutoArm firing at frame %llu (%llu ms since the "
-                                     "last swapchain event). Identical to pressing CTRL+ALT+F10 - "
-                                     "same one-shot, same path. If the game is still in a menu the "
-                                     "stream is armed against menu frames, which is correct but "
-                                     "measures nothing.",
-                                     (unsigned long long)frame, quiet);
-                            mgpu::diag::info(line);
-                            mgpu::gpu1::stream_request();
-                        }
-                    }
-                    else if (!autoarm_waiting_logged)
-                    {
-                        autoarm_waiting_logged = true;
-                        snprintf(line, sizeof line,
-                                 "[MGPU][P7.10] AutoArm reached its frame count at %llu but the "
-                                 "game's swapchain changed %llu ms ago - waiting for %llu ms of "
-                                 "quiet. Arming across a swapchain rebuild is what produces a "
-                                 "session-long run of DROPPED and REORDERED seals.",
-                                 (unsigned long long)frame, quiet,
-                                 (unsigned long long)AUTOARM_QUIET_MS);
-                        mgpu::diag::info(line);
-                    }
-                }
 
                 // The device-removal poll, moved from the 250 ms timer to
                 // a frame counter (every 60 frames, ~1 s at vblank): same
@@ -1159,8 +1231,17 @@ namespace
             mgpu::diag::info("[MGPU][P1.3g] hotkeys unregistered (transit + P6.3 intensity)");
         }
 
-        mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (gpu1::shutdown [present chain -> "
-                         "device] -> DestroyWindow -> UnregisterClass -> adapter::shutdown)");
+        mgpu::diag::info("[MGPU][T5] shutdown - ordered teardown (NGX features -> "
+                         "gpu1::shutdown [present chain -> device] -> DestroyWindow -> "
+                         "UnregisterClass -> adapter::shutdown)");
+
+        // V32. THE NGX FEATURES GO FIRST, BEFORE THE DEVICE THEY WERE CREATED
+        // AGAINST. Nothing did this before: stream_release() only ran on a
+        // failed arm or a stream that reached its frame bound, so an ordinary
+        // game exit abandoned the NR handles, the SR handle, both parameter
+        // blocks and the driver snippet DLL - and then the line below released
+        // the device underneath them. That is the second-launch crash.
+        mgpu::gpu1::stream_shutdown();
 
         mgpu::gpu1::shutdown();
 
