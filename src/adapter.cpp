@@ -62,6 +62,155 @@ namespace mgpu::adapter
 {
 namespace
 {
+using NvPhysicalGpuHandle = void *;
+using NvAPI_Status = int;
+using NvU32 = unsigned int;
+
+using pfn_nvapi_query = void *(*)(unsigned int);
+using pfn_nvapi_init = NvAPI_Status (*)(void);
+using pfn_nvapi_enum_physical_gpus =
+    NvAPI_Status (*)(NvPhysicalGpuHandle *, NvU32 *);
+using pfn_nvapi_get_bus_id =
+    NvAPI_Status (*)(NvPhysicalGpuHandle, NvU32 *);
+using pfn_nvapi_get_adapter_id =
+    NvAPI_Status (*)(NvPhysicalGpuHandle, void *);
+
+static bool resolve_dxgi_index_for_pci_bus(
+    NvU32 wanted_bus,
+    const std::vector<LUID> &dxgi_luids,
+    std::size_t &out_index)
+{
+    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+    if (nvapi == nullptr)
+        nvapi = LoadLibraryW(L"nvapi64.dll");
+
+    if (nvapi == nullptr)
+    {
+        mgpu::diag::warn(
+            "[MGPU][T2] nvapi64.dll unavailable; PCI target cannot be resolved");
+        return false;
+    }
+
+    auto query = reinterpret_cast<pfn_nvapi_query>(
+        GetProcAddress(nvapi, "nvapi_QueryInterface"));
+
+    if (query == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][T2] nvapi_QueryInterface unavailable");
+        return false;
+    }
+
+    auto init = reinterpret_cast<pfn_nvapi_init>(
+        query(0x0150E828u));
+    auto enum_gpus = reinterpret_cast<pfn_nvapi_enum_physical_gpus>(
+        query(0xE5AC921Fu));
+    auto get_bus_id = reinterpret_cast<pfn_nvapi_get_bus_id>(
+        query(0x1BE0B8E5u));
+    auto get_adapter_id = reinterpret_cast<pfn_nvapi_get_adapter_id>(
+        query(0x0FF07FDEu));
+
+    if (init == nullptr || enum_gpus == nullptr ||
+        get_bus_id == nullptr || get_adapter_id == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][T2] required NVAPI entrypoints unavailable");
+        return false;
+    }
+
+    if (init() != 0)
+    {
+        mgpu::diag::warn("[MGPU][T2] NvAPI_Initialize failed");
+        return false;
+    }
+
+    NvPhysicalGpuHandle gpus[64]{};
+    NvU32 count = 0;
+
+    if (enum_gpus(gpus, &count) != 0)
+    {
+        mgpu::diag::warn("[MGPU][T2] NvAPI_EnumPhysicalGPUs failed");
+        return false;
+    }
+
+    if (count != dxgi_luids.size())
+    {
+        mgpu::diag::warn(
+            "[MGPU][T2] NVAPI/DXGI adapter counts differ; refusing index mapping");
+        return false;
+    }
+
+    std::vector<std::size_t> target_indices;
+    std::size_t validated = 0;
+    char line[320];
+
+    for (NvU32 i = 0; i < count; ++i)
+    {
+        NvU32 bus = 0;
+
+        if (get_bus_id(gpus[i], &bus) != 0)
+        {
+            mgpu::diag::warn(
+                "[MGPU][T2] NvAPI_GPU_GetBusId failed; refusing PCI mapping");
+            return false;
+        }
+
+        LUID nv_luid{};
+        const NvAPI_Status luid_status =
+            get_adapter_id(gpus[i], &nv_luid);
+
+        if (bus == wanted_bus)
+        {
+            target_indices.push_back(static_cast<std::size_t>(i));
+
+            snprintf(line, sizeof line,
+                     "[MGPU][T2] NVAPI gpu[%u] pci_bus=0x%02X "
+                     "TARGET dxgi_index=%u adapter_luid_status=%d",
+                     i, bus, i, luid_status);
+            mgpu::diag::info(line);
+            continue;
+        }
+
+        if (luid_status == 0)
+        {
+            if (!luid_eq(nv_luid, dxgi_luids[i]))
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] REFUSING PCI index mapping: "
+                         "NVAPI gpu[%u] LUID does not match DXGI adapter[%u]",
+                         i, i);
+                mgpu::diag::error(line);
+                return false;
+            }
+
+            ++validated;
+        }
+    }
+
+    if (validated == 0)
+    {
+        mgpu::diag::error(
+            "[MGPU][T2] REFUSING PCI index mapping: no NVAPI/DXGI LUID pairs validated");
+        return false;
+    }
+
+    if (target_indices.empty())
+    {
+        snprintf(line, sizeof line,
+                 "[MGPU][T2] no NVAPI adapter found on PCI bus 0x%02X",
+                 wanted_bus);
+        mgpu::diag::warn(line);
+        return false;
+    }
+
+    out_index = target_indices.front();
+
+    snprintf(line, sizeof line,
+             "[MGPU][T2] PCI bus 0x%02X resolved to DXGI adapter[%zu] "
+             "(%zu logical target representations, %zu mappings validated)",
+             wanted_bus, out_index, target_indices.size(), validated);
+    mgpu::diag::info(line);
+
+    return true;
+}
     struct entry
     {
         IDXGIAdapter1 *adapter = nullptr;   // AddRef'd by EnumAdapters1
@@ -309,72 +458,113 @@ namespace
         const char *rule = "none";
         size_t sel = static_cast<size_t>(-1);
         bool degenerate = false;
+
+        // Preserve the authoritative swapchain-LUID safety gate from the
+        // original selector. We must know which adapter owns the game before
+        // selecting a neural coprocessor.
         const choice_result choice =
             choose_adapter(policy.data(), policy.size(), game);
 
         if (!choice.game_luid_found)
         {
-            // The authoritative game LUID is absent from the enumeration.
-            // Every hardware adapter is therefore an untrusted candidate;
-            // output count cannot identify the game's own card in this state.
             snprintf(line, sizeof line,
-                     "[MGPU][T2] REFUSING: the swapchain-derived game luid=0x%08X-0x%08X matches "
-                     "no enumerated adapter (%zu hardware adapters, all candidates) - the "
-                     "game's own card is unidentified. Selecting nothing rather than guessing.",
-                     (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
+                     "[MGPU][T2] REFUSING: swapchain-derived game "
+                     "luid=0x%08X-0x%08X is absent from the DXGI table",
+                     (unsigned)game.HighPart,
+                     (unsigned)game.LowPart);
             mgpu::diag::error(line);
             rule = "none (refused: game luid not in adapter table)";
         }
-        else if (choice.valid)
-        {
-            sel = choice.selected_index;
-            degenerate = choice.degenerate;
-            rule = degenerate
-                       ? "exclusion + software filter + output-count tiebreak "
-                         "(display on target card)"
-                       : "exclusion (luid != swapchain game luid) + software filter";
-        }
-        else if (cand.empty())
-        {
-            // [rule 1] refused: nothing besides the game's own card.
-            snprintf(line, sizeof line,
-                     "[MGPU][T2] REFUSING: no hardware adapter differs from the swapchain-derived "
-                     "game luid=0x%08X-0x%08X (%zu hardware adapters total; the game's is the only "
-                     "one) - single-adapter topology, P0 needs a second GPU. Selecting nothing: a "
-                     "missing device is diagnosable, a device on the wrong adapter is not.",
-                     (unsigned)game.HighPart, (unsigned)game.LowPart, hw.size());
-            mgpu::diag::error(line);
-            rule = "none (refused: no non-game hardware adapter)";
-        }
         else
         {
-            // [rule 1] not yet satisfied: more than one candidate.
-            // [rule 4] the output count is consulted only when more than
-            // two hardware adapters exist - and it must never be the
-            // primary discriminator.
-            for (size_t c : cand)
+            // Explicit neural-GPU target:
+            // Linux PCI 0000:0C:00.0 -> NVAPI bus 0x0C.
+            //
+            // Under Proton/DXVK-NVAPI the headless card may expose several
+            // logical DXGI/NVAPI representations and
+            // NvAPI_GPU_GetAdapterIdFromPhysicalGpu may fail for those
+            // handles. resolve_dxgi_index_for_pci_bus() therefore validates
+            // NVAPI<->DXGI positional mapping against the other adapters
+            // before trusting the target index.
+            std::vector<LUID> dxgi_luids;
+            dxgi_luids.reserve(S.table.size());
+
+            for (const entry &e : S.table)
+                dxgi_luids.push_back(e.luid);
+
+            size_t target_index = static_cast<size_t>(-1);
+
+            if (!resolve_dxgi_index_for_pci_bus(
+                    0x0Cu, dxgi_luids, target_index))
             {
-                snprintf(line, sizeof line,
-                         "[MGPU][T2] candidate adapter[%zu] luid=0x%08X-0x%08X outputs=%u "
-                         "(rule 4 input)",
-                         c, (unsigned)S.table[c].luid.HighPart,
-                         (unsigned)S.table[c].luid.LowPart,
-                         (unsigned)S.table[c].outputs);
-                mgpu::diag::info(line);
+                mgpu::diag::error(
+                    "[MGPU][T2] REFUSING: explicit PCI target "
+                    "0000:0C:00.0 could not be resolved safely");
+                rule = "none (refused: explicit PCI target unresolved)";
             }
-            if (hw.size() > 2)
+            else if (target_index >= S.table.size())
             {
-                size_t n_with_outputs = 0;
-                for (size_t c : cand)
-                    if (S.table[c].outputs > 0)
-                        ++n_with_outputs;
-                snprintf(line, sizeof line,
-                         "[MGPU][T2] REFUSING: %zu non-game hardware adapters remain and the "
-                         "output-count tiebreak is ambiguous (%zu with outputs>0) - it applies "
-                         "only when it picks exactly one. Selecting nothing rather than guessing.",
-                         cand.size(), n_with_outputs);
-                mgpu::diag::error(line);
-                rule = "none (refused: ambiguous)";
+                mgpu::diag::error(
+                    "[MGPU][T2] REFUSING: resolved PCI target index "
+                    "is outside the DXGI adapter table");
+                rule = "none (refused: invalid explicit target index)";
+            }
+            else
+            {
+                const entry &target = S.table[target_index];
+
+                const bool target_is_software =
+                    (target.flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+                    target.vendor_id == 0x1414;
+
+                if (target_is_software)
+                {
+                    mgpu::diag::error(
+                        "[MGPU][T2] REFUSING: explicit PCI target "
+                        "resolved to a software adapter");
+                    rule = "none (refused: target is software)";
+                }
+                else if (target.vendor_id != 0x10DE)
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][T2] REFUSING: explicit PCI target "
+                             "resolved to non-NVIDIA vendor=0x%04X",
+                             (unsigned)target.vendor_id);
+                    mgpu::diag::error(line);
+                    rule = "none (refused: target is not NVIDIA)";
+                }
+                else if (luid_eq(target.luid, game))
+                {
+                    snprintf(line, sizeof line,
+                             "[MGPU][T2] REFUSING: explicit PCI target "
+                             "0000:0C:00.0 is the game's own adapter "
+                             "(luid=0x%08X-0x%08X)",
+                             (unsigned)target.luid.HighPart,
+                             (unsigned)target.luid.LowPart);
+                    mgpu::diag::error(line);
+                    rule = "none (refused: explicit target is game GPU)";
+                }
+                else
+                {
+                    sel = target_index;
+                    degenerate = false;
+                    rule =
+                        "explicit PCI 0000:0C:00.0 "
+                        "via validated NVAPI/DXGI index mapping";
+
+                    snprintf(line, sizeof line,
+                             "[MGPU][T2] explicit neural GPU selected: "
+                             "PCI=0000:0C:00.0 adapter[%zu] "
+                             "luid=0x%08X-0x%08X outputs=%u "
+                             "vendor=0x%04X device=0x%04X",
+                             sel,
+                             (unsigned)target.luid.HighPart,
+                             (unsigned)target.luid.LowPart,
+                             (unsigned)target.outputs,
+                             (unsigned)target.vendor_id,
+                             (unsigned)target.device_id);
+                    mgpu::diag::info(line);
+                }
             }
         }
 
