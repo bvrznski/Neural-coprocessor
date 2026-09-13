@@ -75,6 +75,7 @@ using pfn_nvapi_get_bus_id =
 using pfn_nvapi_get_adapter_id =
     NvAPI_Status (*)(NvPhysicalGpuHandle, void *);
 
+static bool luid_eq(const LUID &a, const LUID &b);
 static bool resolve_dxgi_index_for_pci_bus(
     NvU32 wanted_bus,
     const std::vector<LUID> &dxgi_luids,
