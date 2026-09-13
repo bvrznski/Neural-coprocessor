@@ -666,12 +666,22 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             static bool m_loaded = false;
             static bool m_sr = false;
             static int  m_preset = 0, m_mode = 2;
+            // V27: the match-game toggle, and a restart breadcrumb.
+            //
+            // m_match is DERIVED from SRScale rather than stored in a key of
+            // its own. SRScale=0 already means "inherit R from the game's
+            // render extent" and there is no second meaning for it, so a
+            // separate ini key would be a second source of truth for one fact
+            // - which is how SRScale and SRMvLowRes got out of step in the
+            // first place. Read it, do not store it.
+            static bool m_match = false;
             if (!m_loaded)
             {
                 m_loaded = true;
                 m_sr     = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
                 m_preset = mgpu::gpu1::ui_ini_read("SRPreset", 0);
                 m_mode   = mgpu::gpu1::ui_ini_read("SRQuality", 2);
+                m_match  = (mgpu::gpu1::ui_ini_read("SRScale", 67) == 0);
             }
 
             // ---- V26: THE MODE SETS R. THE SAME LADDER THE ARMED VIEW USES ----
@@ -699,64 +709,147 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // scale is the combination that returned FAIL_PlatformError on
             // 2026-09-12. They are one setting and they are written together
             // in every path below.
+            //
+            // ---- V27: AND THE MATCH-GAME BRANCH WRITES THE OTHER PAIR ----
+            //
+            // Ledger 6k measured two configurations and they are both valid:
+            //
+            //   SRScale=67 SRMvLowRes=1   R is ours. Works on every title,
+            //                             including one rendering at native.
+            //                             The default, and cheaper.
+            //   SRScale=0  SRMvLowRes=0   R is the game's own render extent,
+            //                             so the vectors ARE at R and MV_Scale
+            //                             is untouched. Only does anything
+            //                             when the game is itself upscaling.
+            //
+            // 6k's A/B: evaluate 6.492 ms against 7.459 ms, and L2 10.34
+            // against 11.40. That ~1 ms is the AREA, not the flag - run A's R
+            // was the game's 1485x835 against run B's 1280x720. The flag
+            // itself is a boolean and a scale handed to DLSS.
+            //
+            // 6k also recorded that mode 0 with the vectors NOT at R crashed
+            // at arm, which is why the pair is written together here and why
+            // the toggle cannot produce the third combination.
             const auto write_mode = [](int mode)
             {
-                const int scale = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
-                mgpu::gpu1::ui_ini_write("SRQuality",  mode);
-                mgpu::gpu1::ui_ini_write("SRScale",    scale);
-                mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+                mgpu::gpu1::ui_ini_write("SRQuality", mode);
+                if (m_match)
+                {
+                    mgpu::gpu1::ui_ini_write("SRScale",    0);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
+                }
+                else
+                {
+                    const int scale = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
+                    mgpu::gpu1::ui_ini_write("SRScale",    scale);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+                }
             };
 
             ImGui::SeparatorText("SECOND GPU");
+            // V27. BEFORE THE CONTROLS, for the reason the V12 block below
+            // records: a warning printed after the buttons arrives too late
+            // for the person who already clicked one. Everything here writes
+            // mgpu.ini on the click, and mgpu.ini is read when the stream
+            // ARMS - so nothing in this section changes a running session.
             if (ImGui::Checkbox("Enable DLSS on GPU 1", &m_sr))
             {
                 mgpu::gpu1::ui_ini_write("SRUpscale", m_sr ? 1 : 0);
                 // Turning it on must leave a usable R behind even when the
-                // ini came from 0.1.0 and has SRScale=0 in it.
+                // ini came from 0.1.0 and has SRScale=0 in it. write_mode
+                // honours m_match, so an ini that already said SRScale=0 comes
+                // back with the toggle on rather than being silently reset.
                 if (m_sr) write_mode(m_mode);
             }
-            ImGui::TextDisabled("Neural rendering runs at a reduced size, DLSS enlarges it back.");
+            ImGui::TextDisabled("Neural rendering runs at a reduced resolution, DLSS enlarges it back.");
             ImGui::TextDisabled("Works whatever the game's own DLSS is set to, including off.");
 
+            // ---- V27: GREYED, NEVER HIDDEN ----
+            //
+            // These used to be inside "if (m_sr)", so with DLSS on GPU 1 off
+            // the whole box vanished. People running it once on a title at
+            // DLAA never learned the controls existed at all - they saw an
+            // empty section and concluded there was nothing to set. Greying
+            // shows what is there and why it is not doing anything, which is
+            // the thing a hidden control can never say.
+            ImGui::Spacing();
             if (m_sr)
             {
-                ImGui::TextUnformatted("preset");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("title default##p", m_preset == 0))
-                { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("K##p", m_preset == 11))
-                { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("L##p", m_preset == 12))
-                { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("M##p", m_preset == 13))
-                { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
-                ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
-
-                ImGui::TextUnformatted("mode  ");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("quality##m", m_mode == 2))
-                { m_mode = 2; write_mode(2); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("balanced##m", m_mode == 1))
-                { m_mode = 1; write_mode(1); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("performance##m", m_mode == 0))
-                { m_mode = 0; write_mode(0); }
-                ImGui::TextDisabled("Sets the size neural rendering runs at, the way DLSS does:");
-                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
-
-                // THE NOTICE. Measured once, on one title, on one rig - and
-                // the honest version of that is not silence.
-                ImGui::Spacing();
-                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
-                                   "If you see ghosting or smearing in motion, turn this off.");
-                ImGui::TextDisabled("Reducing the frame and enlarging it back is newer than the");
-                ImGui::TextDisabled("rest of the bridge. It has been clean here and nobody has");
-                ImGui::TextDisabled("ruled out that it ghosts on other games or other hardware.");
+                ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
+                                   "DLSS on GPU 1 is ENABLED for this run.");
             }
+            else
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "DLSS on GPU 1 is DISABLED. CHANGES BELOW ONLY APPLY IF ENABLED.");
+            }
+
+            ImGui::BeginDisabled(!m_sr);
+
+            ImGui::TextUnformatted("preset");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("title default##p", m_preset == 0))
+            { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("K##p", m_preset == 11))
+            { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("L##p", m_preset == 12))
+            { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("M##p", m_preset == 13))
+            { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
+            ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
+
+            // ---- MATCH GAME, BEFORE THE MODE ROW ----
+            //
+            // It comes first because it decides whether the mode row means
+            // anything, and the V12 block further down this file records what
+            // happens otherwise: "SAY IT BEFORE THE BUTTONS, NOT AFTER... the
+            // first person to use this panel clicked a preset, saw no change,
+            // and reasonably concluded the control was broken."
+            if (ImGui::Checkbox("match game", &m_match))
+            {
+                // Rewrite the pair through the same path the modes use, so
+                // SRScale and SRMvLowRes can never be set independently.
+                write_mode(m_mode);
+            }
+            ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
+            ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
+            ImGui::TextDisabled("May reduce ghosting. Costs a little performance.");
+            ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
+
+            // Greyed rather than hidden, for the same reason as the block
+            // above: all three write SRScale and match game overrides it, and
+            // a row that disappears teaches nobody it was ever an option.
+            ImGui::BeginDisabled(m_match);
+            ImGui::TextUnformatted("mode  ");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("quality##m", m_mode == 2))
+            { m_mode = 2; write_mode(2); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("balanced##m", m_mode == 1))
+            { m_mode = 1; write_mode(1); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("performance##m", m_mode == 0))
+            { m_mode = 0; write_mode(0); }
+            ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
+            ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+            ImGui::EndDisabled();
+            if (m_match)
+                ImGui::TextDisabled("Greyed: match game is on, so the game chooses the resolution.");
+
+            // THE NOTICE. Measured once, on one title, on one rig - and
+            // the honest version of that is not silence.
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "If you see ghosting or smearing in motion, turn this off.");
+            ImGui::TextDisabled("Reducing the frame and enlarging it back is newer than the");
+            ImGui::TextDisabled("rest of the bridge. It has been clean here and nobody has");
+            ImGui::TextDisabled("ruled out that it ghosts on other games or other hardware.");
+
+            ImGui::EndDisabled();
+
 
             // ---- V26: THERE IS NO "DLAA MODE" ANY MORE, AND THAT IS THE FIX ----
             //
