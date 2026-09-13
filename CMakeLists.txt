@@ -24,6 +24,20 @@ add_library(mgpu_bridge SHARED
     src/adapter_selection.cpp
     src/worker.cpp
     src/gpu1_context.cpp
+    # P9.1: the lateral acquisition probe. Self-contained - it holds every
+    # ReShade event callback the probe needs and nothing else, so
+    # gpu1_context.cpp keeps its rule of holding no ReShade types and is
+    # not touched by this feature at all.
+    src/probe.cpp
+    # R101: the calibrator. Reads the parameter block the game already hands
+    # DLSS every frame, so acquisition stops being inferred. Self-contained
+    # like probe.cpp - it holds the import-table interception and the reader
+    # and nothing else, so neither gpu1_context nor probe gains a dependency.
+    src/calibrator.cpp
+    # R108: the idle screen. Draws with scissored clears only - no shader,
+    # no font file, no ImGui - so it renders in exactly the situation where
+    # nothing else can: an empty reshade-shaders folder.
+    src/screen.cpp
 )
 
 target_include_directories(mgpu_bridge PRIVATE
