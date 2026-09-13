@@ -35,7 +35,7 @@ Two things moved, and a 0.1.0 install left alone will not work.
      Believe it.
 
   2. mgpu_depth_tap.fx IS NEW AND IS REQUIRED. It goes in ReShade's Shaders
-     folder. Without it the bridge waits for a depth buffer that never arrives
+     folder. It needs no effect packages - it is self-contained. Without it the bridge waits for a depth buffer that never arrives
      and never arms.
 
 
@@ -279,24 +279,38 @@ see, and all of them need a restart.
 
     SRUpscale=0    DLSS Super Resolution on the second card. OFF by default.
     SRQuality=2    2 quality, 1 balanced, 0 performance.
-    SRScale=67     The resolution neural rendering runs at, percent per axis.
-                   The panel's modes write this: quality 67, balanced 58,
-                   performance 50. Only does anything with SRUpscale=1.
+    SRScale=0      Which resolution neural rendering runs at. 0 means the
+                   game's own - see the two upscalers below.
+    SRMvLowRes=0   Rides with SRScale. Never set one without the other.
 
-        With this off, neural rendering runs at the full display resolution,
-        which is the better picture and the more expensive one.
+        With SRUpscale off, neural rendering runs at the full display
+        resolution. That is the most expensive arrangement and the one every
+        published measurement used.
 
-        Turn it on and the second card does its neural work at a smaller
-        resolution and lets DLSS scale the result back up, which makes that
-        work a lot cheaper - worth it if the second card is the weaker of the
-        two, or the one struggling. This is its own setting and does not
-        depend on the game's DLSS, which can be set to anything, or turned off
-        entirely.
+        Turn it on and the second card does its neural work smaller, then
+        lets DLSS enlarge the result - worth it when the second card is the
+        weaker of the two. This is its own setting and does not depend on the
+        game's DLSS, which can be set to anything, or turned off entirely.
 
-        EXPERIMENTAL, and newer than the rest of the bridge. Turn it on in the
-        add-on's panel in the ReShade overlay rather than editing SRScale by
-        hand: the panel writes the scale and the motion-vector flag together,
-        and those two are one setting.
+        THERE ARE TWO WAYS TO DO THAT, and the panel calls them:
+
+          Native Upscaling      SRScale=0  SRMvLowRes=0   THE DEFAULT
+              Upscales from the game's own render resolution. The game's
+              motion vectors already describe that resolution, so they are
+              used exactly as reported with nothing rescaled. It does
+              nothing on a title that is not upscaling - there is no smaller
+              frame to start from, and the log says so.
+
+          Experimental Upscaler SRScale=67 SRMvLowRes=1
+              Works from a downscaled resolution chosen here instead, with
+              the mode buttons, and rescales the game's motion vectors to
+              match. More performance, and it works on every title including
+              one rendering at native. Possible cost in quality. Untested
+              beyond one rig.
+
+        USE THE PANEL RATHER THAN EDITING THESE BY HAND. SRScale and
+        SRMvLowRes are one setting: the panel always writes both, and the
+        combination they must never form is the one that fails at arm.
 
     Frames=0       Run until the game closes. Set a number (60..100000) for a
                    bounded run that ends with a summary.
