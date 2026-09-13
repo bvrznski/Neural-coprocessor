@@ -239,10 +239,7 @@ To arm by hand instead, set AutoArm=0 in mgpu.ini, get into gameplay - not a
 menu - and press CTRL+ALT+F10. Do that before measuring anything: an automatic
 arm can land in a menu or a loading screen.
 
-THE PANEL IS A SETTINGS SCREEN BEFORE THE BRIDGE ARMS. DLSS on the second card
-on or off, preset, and mode. Every click writes mgpu.ini immediately, and
-RESTART THE GAME for any of it to apply - settings are read when the stream
-arms, not when you click.
+
 
 Controls, live, no relaunch:
 
