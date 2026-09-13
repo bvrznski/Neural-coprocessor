@@ -784,111 +784,79 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                    "DLSS on GPU 1 is DISABLED. CHANGES BELOW ONLY APPLY IF ENABLED.");
             }
 
-            // ---- V29: TEXT, NOT BeginDisabled ----
-            //
-            // Everything below stays VISIBLE whatever the state, because the
-            // failure this section had was invisibility: with DLSS on GPU 1
-            // off, the whole box used to vanish and someone running it once on
-            // a title at DLAA never learned these controls existed.
-            //
-            // But greying them with BeginDisabled is not how this panel does
-            // it - that call appears nowhere else in the file. So an inactive
-            // row is drawn as TextDisabled showing its CURRENT VALUE, which is
-            // strictly more informative than a greyed radio: it names the
-            // setting, states what it is set to, and cannot be clicked.
-            const bool live = m_sr;
+            ImGui::BeginDisabled(!m_sr);
 
-            // ---- preset ----
-            if (live)
-            {
-                ImGui::TextUnformatted("preset");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("title default##p", m_preset == 0))
-                { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("K##p", m_preset == 11))
-                { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("L##p", m_preset == 12))
-                { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("M##p", m_preset == 13))
-                { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
-                ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
-            }
-            else
-            {
-                const char *pn = (m_preset == 11) ? "K"
-                               : (m_preset == 12) ? "L"
-                               : (m_preset == 13) ? "M" : "title default";
-                ImGui::TextDisabled("preset: %s", pn);
-            }
+            ImGui::TextUnformatted("preset");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("title default##p", m_preset == 0))
+            { m_preset = 0;  mgpu::gpu1::ui_ini_write("SRPreset", 0); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("K##p", m_preset == 11))
+            { m_preset = 11; mgpu::gpu1::ui_ini_write("SRPreset", 11); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("L##p", m_preset == 12))
+            { m_preset = 12; mgpu::gpu1::ui_ini_write("SRPreset", 12); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("M##p", m_preset == 13))
+            { m_preset = 13; mgpu::gpu1::ui_ini_write("SRPreset", 13); }
+            ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
 
-            // ---- upscaling ----
+            // ---- MATCH GAME, BEFORE THE MODE ROW ----
             //
+            // It comes first because it decides whether the mode row means
+            // anything, and the V12 block further down this file records what
+            // happens otherwise: "SAY IT BEFORE THE BUTTONS, NOT AFTER... the
+            // first person to use this panel clicked a preset, saw no change,
+            // and reasonably concluded the control was broken."
             // Two named modes rather than a checkbox, because they are two
             // ways of choosing R and neither is an option on the other. Both
             // write SRScale and SRMvLowRes through write_mode, so the pair can
             // never be set independently - the combination that crashed at arm
             // on 2026-09-12 is unreachable from this panel.
-            if (live)
-            {
-                ImGui::TextUnformatted("upscaling");
-                if (ImGui::RadioButton("Native Upscaling", m_match))
-                { m_match = true;  write_mode(m_mode); }
-                ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
-                ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
-                ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
-                ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
+            ImGui::TextUnformatted("upscaling");
+            if (ImGui::RadioButton("Native Upscaling", m_match))
+            { m_match = true;  write_mode(m_mode); }
+            ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
+            ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
+            ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
+            ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
 
-                if (ImGui::RadioButton("Experimental Upscaling", !m_match))
-                { m_match = false; write_mode(m_mode); }
-                ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
-                ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
-                ImGui::TextDisabled("works on a title that is not upscaling at all.");
-                ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
-                ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
-            }
-            else
-            {
-                ImGui::TextDisabled("upscaling: %s",
-                                    m_match ? "Native Upscaling" : "Experimental Upscaling");
-            }
+            if (ImGui::RadioButton("Experimental Upscaling", !m_match))
+            { m_match = false; write_mode(m_mode); }
+            ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
+            ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
+            ImGui::TextDisabled("works on a title that is not upscaling at all.");
+            ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
+            ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
 
-            // ---- mode ----
-            //
-            // Interactive only under Experimental: all three write SRScale and
-            // Native Upscaling overrides it. Shown as text otherwise, so the
-            // row never disappears and always says what it is set to.
-            //
-            // The "why" line is one clause on purpose. An earlier version read
-            // "so the game chooses the resolution", which invited the reading
-            // that the second card stops upscaling - it does not. It upscales
-            // either way; what changes is which resolution it starts from and
-            // whether the motion vectors are rescaled to match.
-            if (live && !m_match)
-            {
-                ImGui::TextUnformatted("mode  ");
-                ImGui::SameLine();
-                if (ImGui::RadioButton("quality##m", m_mode == 2))
-                { m_mode = 2; write_mode(2); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("balanced##m", m_mode == 1))
-                { m_mode = 1; write_mode(1); }
-                ImGui::SameLine();
-                if (ImGui::RadioButton("performance##m", m_mode == 0))
-                { m_mode = 0; write_mode(0); }
-                ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
-                ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
-            }
-            else
-            {
-                const char *mn = (m_mode == 2) ? "quality"
-                               : (m_mode == 1) ? "balanced" : "performance";
-                ImGui::TextDisabled("mode: %s", mn);
-                if (live && m_match)
-                    ImGui::TextDisabled("Native Upscaling is on.");
-            }
+            // Greyed rather than hidden, for the same reason as the block
+            // above: all three write SRScale, Native Upscaling overrides it,
+            // and a row that disappears teaches nobody it was ever an option.
+            ImGui::BeginDisabled(m_match);
+            ImGui::TextUnformatted("mode  ");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("quality##m", m_mode == 2))
+            { m_mode = 2; write_mode(2); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("balanced##m", m_mode == 1))
+            { m_mode = 1; write_mode(1); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("performance##m", m_mode == 0))
+            { m_mode = 0; write_mode(0); }
+            ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
+            ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+            ImGui::EndDisabled();
+            if (m_match)
+                ImGui::TextDisabled("Greyed: Native Upscaling is on, so the game chooses the resolution.");
+
+            // V28: THE OLD NOTICE IS GONE. It said "if you see ghosting or
+            // smearing in motion, turn this off", written when this section
+            // had one toggle and "this" could only mean SR. With Native and
+            // Experimental named above it, "this" no longer has one referent,
+            // and both blurbs already carry the honest framing and the ask for
+            // reports. A warning nobody can resolve to a control is noise.
+
+            ImGui::EndDisabled();
 
 
             // ---- V26: THERE IS NO "DLAA MODE" ANY MORE, AND THAT IS THE FIX ----
@@ -1032,9 +1000,33 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // not the transport, not the ring, not the neural stage. That is
         // exactly why these two are safe to expose and why the DLAA lever
         // below is not.
+        // ---- V31: THIS SECTION IS NEVER HIDDEN ----
+        //
+        // It used to be "if (st.sr_on)", so with super resolution off the
+        // whole block vanished from the ARMED view - and that is the view
+        // almost everyone sees, because AutoArm=1 arms the stream within
+        // seconds of the game presenting. Someone opening the panel with Home
+        // on a title where SR was off found no quality or preset controls at
+        // all, and no way to learn they existed.
+        ImGui::SeparatorText("Change quality or preset");
+        if (!st.sr_on)
+        {
+            static const char *qn2[] = { "performance", "balanced", "quality" };
+            const char *pn2 = (st.sr_preset == 11) ? "K"
+                            : (st.sr_preset == 12) ? "L"
+                            : (st.sr_preset == 13) ? "M" : "title default";
+            ImGui::TextDisabled("quality: %s",
+                                (st.sr_quality >= 0 && st.sr_quality <= 2)
+                                    ? qn2[st.sr_quality] : "unknown");
+            ImGui::TextDisabled("preset:  %s", pn2);
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                               "Super resolution is not running, so these cannot be changed now.");
+            ImGui::TextDisabled("Set SRUpscale=1 in mgpu.ini and restart. The Super resolution");
+            ImGui::TextDisabled("box above says whether it was off, or requested and refused.");
+        }
         if (st.sr_on)
         {
-            ImGui::SeparatorText("Change quality or preset");
             // SAY IT BEFORE THE BUTTONS, NOT AFTER. These radios STAGE a
             // choice; nothing happens until APPLY. The first person to use
             // this panel clicked a preset, saw no change, and reasonably
@@ -1108,7 +1100,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             }
         }
 
-        // ---- V29: THE AUTO READOUT IS GONE, FOR THE REFLEX REASON ----
+        // ---- V31: THE AUTO READOUT IS GONE, FOR THE REFLEX REASON ----
         //
         // It was a status block with no control, whose off state read "Auto=1
         // and AutoTargetFps in mgpu.ini". That is an instruction to switch on
@@ -1116,9 +1108,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // rebuild path it depends on has never executed once.
         //
         // Telling a user how to enable something untested, in the panel, is
-        // the same trap the Reflex readout was: it reads as a supported
-        // option because it is in the interface. The keys stay in mgpu.ini for
-        // testing. When Auto has actually run, it comes back with a control
+        // the same trap the Reflex readout was: it reads as a supported option
+        // because it is in the interface. The keys stay in mgpu.ini for
+        // testing. When Auto has actually run it comes back with a control
         // rather than a hint.
 
         // ---- Settings: writes the file, takes effect next launch ----
