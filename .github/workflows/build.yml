@@ -197,11 +197,40 @@ jobs:
             exit 1
           fi
 
+      # 0.2.0. THE HEADLINE FEATURE MUST BE ON IN THE SHIPPED FILE.
+      #
+      # Depth and MVec default to OFF in gpu1_context when the key is ABSENT,
+      # not when it is 0. So an assets/mgpu.ini carried over from 0.1.0 - which
+      # has neither key - ships 0.2.0 with engine depth and motion vectors
+      # disabled, and every other check in this workflow stays green. That is
+      # the exact failure this step exists to catch: a release whose entire
+      # content is missing, with nothing red anywhere.
+      #
+      # Depth=1 additionally requires the tap shader, which is why the step
+      # below verifies the config set rather than trusting it.
+      - name: Verify the shipped transport is on
+        shell: bash
+        run: |
+          FAIL=0
+          if ! grep -qE '^\s*Depth\s*=\s*1\s*$' assets/mgpu.ini; then
+            echo "::error::assets/mgpu.ini does not set Depth=1 - the shipped build must bind engine depth"
+            grep -nE '^\s*Depth\s*=' assets/mgpu.ini || echo "  (the key is absent entirely, which reads as OFF)"
+            FAIL=1
+          fi
+          if ! grep -qE '^\s*MVec\s*=\s*3\s*$' assets/mgpu.ini; then
+            echo "::error::assets/mgpu.ini does not set MVec=3 - the shipped build must bind the game's motion vectors"
+            grep -nE '^\s*MVec\s*=' assets/mgpu.ini || echo "  (the key is absent entirely, which reads as OFF)"
+            FAIL=1
+          fi
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "assets/mgpu.ini ships Depth=1 and MVec=3."
+
       - name: Verify the config set is present
         shell: bash
         run: |
           MISSING=0
-          for F in assets/gpu1.ini assets/mgpu.ini assets/ReShade2.ini assets/README.txt LICENSE; do
+          for F in assets/gpu1.ini assets/mgpu.ini assets/ReShade2.ini assets/README.txt \
+                   assets/reshade-shaders/Shaders/mgpu_depth_tap.fx LICENSE; do
             if [ ! -f "$F" ]; then
               echo "::error::missing $F"
               MISSING=1
@@ -209,8 +238,11 @@ jobs:
           done
           [ "$MISSING" -eq 0 ] || exit 1
 
-      # The artifact is the complete deploy set: every file here goes into
-      # <game>\...\Binaries\Win64\ beside dxgi.dll, at the zip root.
+      # The artifact is the complete deploy set. Unpack it into
+      # <game>\...\Binaries\Win64\ beside dxgi.dll: six files at the zip root,
+      # plus reshade-shaders\Shaders\mgpu_depth_tap.fx, which must keep its
+      # path because ReShade loads it from a shader search path rather than
+      # from the game folder.
       # Staged into one directory on purpose — upload-artifact roots the zip
       # at the least common ancestor of its inputs, so listing build/... and
       # assets/... directly would preserve both paths instead of flattening.
@@ -245,9 +277,23 @@ jobs:
           cp assets/ReShade2.ini  _deploy/
           cp assets/README.txt    _deploy/
           cp LICENSE              _deploy/
-          ls -l _deploy
+          # 0.2.0. THE TAP SHADER, AND IT KEEPS ITS SUBFOLDER ON PURPOSE.
+          #
+          # Everything else in this set lands beside the game .exe, flat. This
+          # one does not: ReShade only loads it from a shader search path, so
+          # it is staged at reshade-shaders/Shaders/ and the zip carries that
+          # structure. Unpacking the whole artifact into the game folder then
+          # puts every file where it belongs with no reading required, which is
+          # the only install step that is not "copy a file in".
+          #
+          # Depth=1 ships, and without this file ReShade never binds a depth
+          # buffer and the bridge never arms.
+          mkdir -p _deploy/reshade-shaders/Shaders
+          cp assets/reshade-shaders/Shaders/mgpu_depth_tap.fx _deploy/reshade-shaders/Shaders/
+          find _deploy -type f | sort
           test -f _deploy/nvngx.dll_mgpu_bridge.addon64
           test -f _deploy/mgpu.ini
+          test -f _deploy/reshade-shaders/Shaders/mgpu_depth_tap.fx
           case "$(ls _deploy)" in
             *nvngx.dll_*) ;;
             *) echo "::error::Deploy set does not carry the nvngx.dll_ caller-gate prefix"; exit 1 ;;
@@ -260,15 +306,20 @@ jobs:
           echo "--- mgpu.ini keys as shipped ---"
           grep -vE '^\s*(;|$)' _deploy/mgpu.ini || true
 
-      # The artifact is six files. Stated as a number so that a file added to
+      # The artifact is seven files. Stated as a number so that a file added to
       # assets/ without a decision cannot reach a user's game folder unnoticed.
-      - name: Verify the artifact is exactly the six-file set
+      #
+      # 0.2.0 raised this from six, for mgpu_depth_tap.fx. COUNT RECURSIVELY:
+      # that file is in a subdirectory, so `ls -1 _deploy` would see one entry
+      # named reshade-shaders and count a directory as a file - it would pass
+      # at seven whether the shader was inside it or not.
+      - name: Verify the artifact is exactly the seven-file set
         shell: bash
         run: |
-          COUNT=$(ls -1 _deploy | wc -l)
-          if [ "$COUNT" -ne 6 ]; then
-            echo "::error::_deploy holds $COUNT files, expected 6"
-            ls -1 _deploy
+          COUNT=$(find _deploy -type f | wc -l)
+          if [ "$COUNT" -ne 7 ]; then
+            echo "::error::_deploy holds $COUNT files, expected 7"
+            find _deploy -type f | sort
             exit 1
           fi
 
