@@ -1,4 +1,4 @@
-# Neural Coprocessor - Complete README
+# Neural Coprocessor - 
 
 ## Project Overview
 
