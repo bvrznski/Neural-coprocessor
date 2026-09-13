@@ -75,7 +75,6 @@ using pfn_nvapi_get_bus_id =
 using pfn_nvapi_get_adapter_id =
     NvAPI_Status (*)(NvPhysicalGpuHandle, void *);
 
-static bool luid_eq(const LUID &a, const LUID &b);
 static bool resolve_dxgi_index_for_pci_bus(
     NvU32 wanted_bus,
     const std::vector<LUID> &dxgi_luids,
@@ -172,7 +171,7 @@ static bool resolve_dxgi_index_for_pci_bus(
 
         if (luid_status == 0)
         {
-            if (!luid_eq(nv_luid, dxgi_luids[i]))
+            if ((nv_luid.LowPart != dxgi_luids[i].LowPart || nv_luid.HighPart != dxgi_luids[i].HighPart))
             {
                 snprintf(line, sizeof line,
                          "[MGPU][T2] REFUSING PCI index mapping: "
