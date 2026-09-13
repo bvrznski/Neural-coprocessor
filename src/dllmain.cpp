@@ -816,7 +816,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextUnformatted("upscaling");
             if (ImGui::RadioButton("Native Upscaling", m_match))
             { m_match = true;  write_mode(m_mode); }
-            ImGui::TextDisabled("Upscales from the game's own render resolution.");
+            ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
             if (ImGui::RadioButton("Experimental Upscaler", !m_match))
             { m_match = false; write_mode(m_mode); }
@@ -1218,7 +1218,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextUnformatted("upscaling");
             if (ImGui::RadioButton("Native Upscaling##su", want_match))
             { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
-            ImGui::TextDisabled("Upscales from the game's own render resolution.");
+            ImGui::TextDisabled("Upscales from the game's own render resolution. Higher quality.");
 
             if (ImGui::RadioButton("Experimental Upscaler##su", !want_match))
             { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
