@@ -83,7 +83,7 @@ A launch and transport check, not a benchmark. The counters in those logs are cu
 - **Two GPUs and two monitors** (one monitor per card; headless operation is slower)
 - **Add-on-enabled ReShade build, 6.8.0 or newer**
 - **DirectX 12 games only** (D3D11 and Vulkan unsupported)
-- **No shader packs required.** `mgpu_depth_tap.fx` is self-contained as of 0.2.1
+- **No shader packs required**
 - **No other add-ons** (to avoid multiple NGX consumers)
 
 ---
@@ -109,7 +109,7 @@ See `assets/README.txt` for complete installation instructions. Critical require
 - ReShade must support add-ons (effects-only build will not load `.addon64` files)
 - File name must contain the literal substring `nvngx.dll`
 - **`nvngx_dlssnr.dll` goes in a folder called `mgpu`, next to the add-on. NOT beside the game executable.** Beside the executable some titles load it themselves and the neural stage will crash. This changed in 0.2.0.
-- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list, and as of 0.2.1 it needs no effect packages either. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. `ReShade.log` says `TAP = ABSENT` when it is missing.
+- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list. Without it ReShade never binds a depth buffer and the bridge waits instead of arming; `ReShade.log` says `TAP = ABSENT`. On 0.2.0 it also needs ReShade's standard effects pack installed - or upgrade to 0.2.1, which removes that requirement.
 
 ---
 
