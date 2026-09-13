@@ -42,7 +42,52 @@
 //   res=0x0                                       -> it is necessary, and we
 //                                                   learned that for free
 
-#include "ReShade.fxh"
+// ---- 0.2.1: NO INCLUDE. THIS FILE STANDS ALONE. ----
+//
+// 0.2.0 opened with #include "ReShade.fxh", and a user reported the add-on
+// failing after skipping the standard effects pack in the ReShade installer.
+// They were right and the cause was this line: that header ships WITH the
+// effects pack. Without it the tap does not compile, the log says TAP =
+// ABSENT, and with Depth=1 the bridge never arms. 0.1.0 needed no effects at
+// all, so 0.2.0 quietly added an install step and only found out from a user.
+//
+// The header supplied three things to this file and only two came from it:
+//
+//   ReShade::DepthBuffer   a texture with the DEPTH semantic, and a sampler
+//   PostProcessVS          the fullscreen-triangle vertex shader
+//   BUFFER_WIDTH/HEIGHT    NOT from the header. ReShade's compiler injects
+//                          these; the header consumes them like anyone else.
+//
+// Both are declared below, which is eight lines. Nothing else in that header
+// was used.
+//
+// AND IT IS MORE CORRECT THIS WAY. ReShade.fxh exists mostly to apply depth
+// transforms - reversed-Z, upside-down, mirrored, scale and offset, the
+// linearizer. This file samples RAW depth on purpose (see PS_MGPUDepthTap
+// below) because the rig carries RESHADE_DEPTH_INPUT_IS_REVERSED=0 on a
+// reversed-Z title, so the linearizer is wrong here and the reversed-Z
+// decision belongs next to the model instead. Including a header whose whole
+// job is transforms this file then refuses to use was backwards.
+//
+// The semantic is what matters, and the semantic is declared here directly.
+// ReShade's semantic system is a PUSH: it writes the detected buffer into
+// EVERY texture variable declared with that semantic, so ours is filled the
+// same way the header's would have been.
+
+texture MGPU_SceneDepthTex : DEPTH;
+sampler MGPU_SceneDepth { Texture = MGPU_SceneDepthTex; };
+
+// The fullscreen triangle, bufferless. Same three vertices the standard
+// header uses, under our own name so the two cannot collide if some other
+// effect in the path does include it.
+void MGPU_FullscreenVS(in uint id : SV_VertexID,
+                       out float4 position : SV_Position,
+                       out float2 texcoord : TEXCOORD)
+{
+    texcoord.x = (id == 2) ? 2.0 : 0.0;
+    texcoord.y = (id == 1) ? 2.0 : 0.0;
+    position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
 
 texture MGPU_DepthOutTex
 {
@@ -72,19 +117,19 @@ sampler MGPU_MotionProbe { Texture = MGPU_MotionProbeTex; };
 
 float PS_MGPUDepthTap(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
-    // tex2Dlod, matching ReShade.fxh's own use of this sampler exactly, so
-    // this file cannot compile differently from the header it borrows from.
+    // tex2Dlod, which is what the standard header used on this sampler, so
+    // 0.2.1 samples exactly what 0.2.0 sampled.
     //
     // Raw, NOT GetLinearizedDepth: this rig carries
     // RESHADE_DEPTH_INPUT_IS_REVERSED=0 on a UE5 reversed-Z title (R51), so
     // the linearizer is wrong here. Raw means this file has no opinion, and
     // the reversed-Z decision stays where it belongs - next to the model.
     //
-    // ReShade::DepthBuffer filters LINEAR, so sampling a render-resolution
+    // The DEPTH sampler filters LINEAR by default, so sampling a render-resolution
     // depth at output-resolution coordinates IS the upsample. Bilinear across
     // a silhouette invents a depth that exists nowhere, which is the known
     // cost of this and is a one-line change to POINT if it shows.
-    const float d = tex2Dlod(ReShade::DepthBuffer, float4(uv, 0, 0)).x;
+    const float d = tex2Dlod(MGPU_SceneDepth, float4(uv, 0, 0)).x;
 
     // R69: the motion probe is SAMPLED so the compiler cannot strip the
     // texture and take the semantic with it. The test is only true for NaN,
@@ -104,7 +149,7 @@ technique MGPU_DepthTap
 {
     pass
     {
-        VertexShader = PostProcessVS;
+        VertexShader = MGPU_FullscreenVS;
         PixelShader  = PS_MGPUDepthTap;
         // The back buffer is never touched now - P0.0 needed a discard to stay
         // invisible, this writes somewhere else entirely.
