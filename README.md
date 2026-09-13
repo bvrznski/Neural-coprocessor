@@ -1,4 +1,4 @@
-# Neural Coprocessor - 
+# Neural Coprocessor
 
 ## Project Overview
 
