@@ -19,8 +19,10 @@ This is research code with published measurements. It is not a product.
 Also in 0.2.0:
 
 - **The game's own depth and motion vectors now reach DLSS 5 on the second card.** It derives motion from colour on its own, which is what 0.1.0 ran on. Feeding it the engine's real depth and velocity gives it ground truth instead of an estimate, and the gain is image stability: less jitter and sizzle on faces and fine geometry while the camera moves. On a frame that cannot supply them, a menu or a load screen, they are unbound rather than left pointing at the last frame's, and the derived motion takes over for as long as that lasts.
-- **Both cards now have their own DLSS Super Resolution pass.** The second card can do its neural work at a smaller resolution and let DLSS scale the result back up to full resolution, which makes that work a lot cheaper. This is its own setting and does not depend on the game's DLSS, which can be set to anything, or turned off entirely. That gives a weaker second card a way to keep up with a stronger render card, and it is what makes DLSS 5 affordable on older titles where the card doing the neural rendering was struggling. The quality, balanced and performance modes choose that resolution. It ships off, so neural rendering runs at full resolution out of the box. **Experimental**, and newer than the rest of the bridge: turn it on in the add-on's panel in the ReShade overlay.
+- **Both cards now have their own DLSS Super Resolution pass.** The second card can do its neural work at a smaller resolution and let DLSS scale the result back up to full resolution, which makes that work a lot cheaper. This is its own setting and does not depend on the game's DLSS, which can be set to anything, or turned off entirely. That gives a weaker second card a way to keep up with a stronger render card, and it is what makes DLSS 5 affordable on older titles where the card doing the neural rendering was struggling. It ships off, so neural rendering runs at full resolution out of the box.
 - **General optimization, and lower latency at higher resolutions.** The two cards now balance the load between them rather than each running at its own pace, in either direction, so a mismatch in speed no longer builds into a backlog. That is also what paid for depth and motion vectors: what they cost to move still fits inside the one frame window 0.1.0 ran on. **The latency improvement requires Reflex.**
+
+**0.2.1 is a hotfix on top of this.** `mgpu_depth_tap.fx` no longer needs ReShade's standard effects pack - it included `ReShade.fxh` from that pack, so skipping the pack in the installer made the tap fail to compile and the bridge never arm. Reported by a user after 0.2.0 shipped; the report was correct. Super Resolution on the second card also gained two named modes in the panel, `Native Upscaling` and `Experimental Upscaler`, with Native Upscaling as the default because it is the higher quality of the two.
 
 ---
 
@@ -81,7 +83,7 @@ A launch and transport check, not a benchmark. The counters in those logs are cu
 - **Two GPUs and two monitors** (one monitor per card; headless operation is slower)
 - **Add-on-enabled ReShade build, 6.8.0 or newer**
 - **DirectX 12 games only** (D3D11 and Vulkan unsupported)
-- **No shader packs required**
+- **No shader packs required.** `mgpu_depth_tap.fx` is self-contained as of 0.2.1
 - **No other add-ons** (to avoid multiple NGX consumers)
 
 ---
@@ -107,7 +109,7 @@ See `assets/README.txt` for complete installation instructions. Critical require
 - ReShade must support add-ons (effects-only build will not load `.addon64` files)
 - File name must contain the literal substring `nvngx.dll`
 - **`nvngx_dlssnr.dll` goes in a folder called `mgpu`, next to the add-on. NOT beside the game executable.** Beside the executable some titles load it themselves and the neural stage will crash. This changed in 0.2.0.
-- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. `ReShade.log` says `TAP = ABSENT` when it is missing.
+- **`mgpu_depth_tap.fx` goes in ReShade's `Shaders` folder.** The add-on switches it on itself, so nothing needs enabling in the effects list, and as of 0.2.1 it needs no effect packages either. Without it ReShade never binds a depth buffer and the bridge waits instead of arming. `ReShade.log` says `TAP = ABSENT` when it is missing.
 
 ---
 
@@ -144,7 +146,8 @@ Two cables from two cards into one monitor was explored and did not reach someth
 | `AutoArm=1` | Arms stream automatically; set to `0` to arm manually |
 | `SRUpscale=0` | DLSS Super Resolution on the second card. Off by default, so neural rendering runs at full resolution |
 | `SRQuality=2` | 2 quality, 1 balanced, 0 performance |
-| `SRScale=67` | Resolution neural rendering runs at, percent per axis. The panel's modes write this. `0` inherits the game's own render extent, which does nothing on a title rendering at native |
+| `SRScale=0` | Which resolution neural rendering runs at. `0` is Native Upscaling - the game's own render extent. `67`/`58`/`50` is Experimental Upscaler, chosen by the panel's mode buttons |
+| `SRMvLowRes=0` | Rides with `SRScale` and is written with it. Never set one without the other |
 | `Depth=1` | Send the game's depth to the second card and bind it. Needs `mgpu_depth_tap.fx` |
 | `MVec=3` | Send the game's motion vectors and bind them. `0` leaves the model to its own derivation |
 | `SRPreset=0` | 0 title default, 11 K, 12 L, 13 M |
