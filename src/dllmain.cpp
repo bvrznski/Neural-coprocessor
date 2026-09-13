@@ -1135,15 +1135,21 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // block above and is not repeated here.
             static bool ini_loaded = false;
             static bool want_sr = false;
+            // V32: the rest of the settings, which were never in this box.
+            // want_match is DERIVED from SRScale rather than stored in a key
+            // of its own - SRScale=0 already means "inherit R from the game's
+            // render extent" and has no second meaning, so a separate key
+            // would be a second source of truth for one fact.
+            static int  want_p = 0, want_m = 2;
+            static bool want_match = true;
             if (!ini_loaded)
             {
                 ini_loaded   = true;
                 want_sr      = (mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0);
+                want_p       = mgpu::gpu1::ui_ini_read("SRPreset", 0);
+                want_m       = mgpu::gpu1::ui_ini_read("SRQuality", 2);
+                want_match   = (mgpu::gpu1::ui_ini_read("SRScale", 0) == 0);
             }
-
-            // Latched, not per-frame. The click lasts one frame and the
-            // message has to outlive it or nobody ever sees it.
-            static bool wrote_any = false;
 
             // SUPER RESOLUTION ITSELF, AND IT GOES FIRST BECAUSE IT GATES THE
             // REST. With the shipped mgpu.ini, SRUpscale is absent and
@@ -1151,12 +1157,104 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             // mgpu.ini" and there was no way to turn it on from here at all.
             // A panel that can only report a feature nobody can reach is not a
             // panel. Arm-time key, so it is a restart like the others.
+            // Latched, not per-frame. The click lasts one frame and the
+            // message has to outlive it or nobody ever sees it.
+            static bool wrote_any = false;
+
             if (ImGui::Checkbox("DLSS Super Resolution on GPU 1", &want_sr))
             {
                 wrote_any |= mgpu::gpu1::ui_ini_write("SRUpscale", want_sr ? 1 : 0);
             }
             ImGui::TextDisabled("Neural rendering runs at R, then DLSS enlarges it back to");
             ImGui::TextDisabled("the display. Everything else in this box needs it on.");
+
+            // ---- V32: THE REST OF THE SETTINGS, IN THE SETTINGS BOX ----
+            //
+            // This box held ONE checkbox. preset, upscaling and mode existed
+            // only in the pre-arm menu, which with AutoArm=1 is on screen for
+            // a couple of seconds and which almost nobody reaches. So ticking
+            // the box here appeared to reveal controls on the next launch,
+            // when what it actually did was let SR create, which uncovered the
+            // separate live "Change quality or preset" block further up.
+            //
+            // Everything that writes mgpu.ini now lives here, under the one
+            // restart line at the bottom. Greyed rather than hidden when SR is
+            // off, because a box that empties itself teaches nobody what it
+            // holds.
+            //
+            // SRMvLowRes RIDES WITH SRScale in both branches. The flag without
+            // the scale is what returned FAIL_PlatformError on 2026-09-12, and
+            // writing them together is what makes that combination unreachable
+            // from this panel.
+            const auto write_sr_mode = [](int mode, bool match)
+            {
+                mgpu::gpu1::ui_ini_write("SRQuality", mode);
+                if (match)
+                {
+                    mgpu::gpu1::ui_ini_write("SRScale",    0);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
+                }
+                else
+                {
+                    const int sc = (mode == 2) ? 67 : ((mode == 1) ? 58 : 50);
+                    mgpu::gpu1::ui_ini_write("SRScale",    sc);
+                    mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
+                }
+                return true;
+            };
+
+            ImGui::Spacing();
+            ImGui::BeginDisabled(!want_sr);
+
+            ImGui::TextUnformatted("preset");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("title default##sp", want_p == 0))
+            { want_p = 0;  wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 0); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("K##sp", want_p == 11))
+            { want_p = 11; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 11); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("L##sp", want_p == 12))
+            { want_p = 12; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 12); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("M##sp", want_p == 13))
+            { want_p = 13; wrote_any |= mgpu::gpu1::ui_ini_write("SRPreset", 13); }
+            ImGui::TextDisabled("A DLL that lacks the preset asked for uses its own instead.");
+
+            ImGui::TextUnformatted("upscaling");
+            if (ImGui::RadioButton("Native Upscaling##su", want_match))
+            { want_match = true;  wrote_any |= write_sr_mode(want_m, true); }
+            ImGui::TextDisabled("Upscales from the game's own render resolution, so its motion");
+            ImGui::TextDisabled("vectors are used exactly as reported with no rescaling.");
+            ImGui::TextDisabled("May reduce ghosting. Costs a little performance. THE DEFAULT.");
+            ImGui::TextDisabled("Does nothing if the game is not upscaling - see the log.");
+
+            if (ImGui::RadioButton("Experimental Upscaling##su", !want_match))
+            { want_match = false; wrote_any |= write_sr_mode(want_m, false); }
+            ImGui::TextDisabled("Picks the resolution here instead, with the mode below, and");
+            ImGui::TextDisabled("rescales the game's motion vectors to match. Cheaper, and it");
+            ImGui::TextDisabled("works on a title that is not upscaling at all.");
+            ImGui::TextDisabled("EXPERIMENTAL and UNTESTED beyond one rig. Please report what");
+            ImGui::TextDisabled("you see - image quality reports are the thing this needs.");
+
+            ImGui::BeginDisabled(want_match);
+            ImGui::TextUnformatted("mode  ");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("quality##sm", want_m == 2))
+            { want_m = 2; wrote_any |= write_sr_mode(2, want_match); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("balanced##sm", want_m == 1))
+            { want_m = 1; wrote_any |= write_sr_mode(1, want_match); }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("performance##sm", want_m == 0))
+            { want_m = 0; wrote_any |= write_sr_mode(0, want_match); }
+            ImGui::TextDisabled("Sets the resolution neural rendering runs at, the way DLSS does:");
+            ImGui::TextDisabled("quality 67%%, balanced 58%%, performance 50%% of the display.");
+            ImGui::EndDisabled();
+            if (want_match)
+                ImGui::TextDisabled("Native Upscaling is on.");
+
+            ImGui::EndDisabled();
 
             ImGui::Spacing();
             if (wrote_any)
