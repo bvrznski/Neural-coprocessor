@@ -239,8 +239,6 @@ To arm by hand instead, set AutoArm=0 in mgpu.ini, get into gameplay - not a
 menu - and press CTRL+ALT+F10. Do that before measuring anything: an automatic
 arm can land in a menu or a loading screen.
 
-
-
 Controls, live, no relaunch:
 
     Panel               the ReShade overlay (Home). The MGPU Bridge panel is
