@@ -35,8 +35,8 @@ Two things moved, and a 0.1.0 install left alone will not work.
      Believe it.
 
   2. mgpu_depth_tap.fx IS NEW AND IS REQUIRED. It goes in ReShade's Shaders
-     folder. It needs no effect packages - it is self-contained. Without it the bridge waits for a depth buffer that never arrives
-     and never arms.
+     folder. It needs no effect packages - it is self-contained. Without it
+     the bridge waits for a depth buffer that never arrives and never arms.
 
 
 WHAT YOU NEED FIRST
