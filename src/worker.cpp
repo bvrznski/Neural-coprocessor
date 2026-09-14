@@ -217,6 +217,11 @@ namespace
     void pick_bridge_placement(const mgpu::adapter::selection_result &sel,
                                bridge_placement &out)
     {
+        // DIAGNOSTIC: bypass DXGI output placement under Proton.
+        // Leave known=false and CW_USEDEFAULT to isolate T5 swapchain creation.
+        snprintf(out.detail, sizeof out.detail,
+                 "DIAGNOSTIC: DXGI output placement bypassed; using CW_USEDEFAULT");
+        return;
         const int want = mgpu::gpu1::monitor_index();   // -1 = auto
 
         IDXGIAdapter1 *ad1 = static_cast<IDXGIAdapter1 *>(sel.selected_adapter);
