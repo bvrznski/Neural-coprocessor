@@ -594,6 +594,71 @@ static bool resolve_dxgi_index_for_pci_bus(
             S.result.rule = rule;
             S.result.selected_adapter = e.adapter;
 
+            // Determine presentation adapter:
+            // Neural GPU (PCI 0C) is headless, so we need a separate presentation GPU
+            // Prefer game adapter if different from neural and has outputs
+            
+            size_t present_sel = static_cast<size_t>(-1);
+            
+            // First try: use game adapter as presentation if it's display-capable and different
+            if (!luid_eq(game, e.luid)) {
+                for (size_t i = 0; i < S.table.size(); ++i) {
+                    const entry &candidate = S.table[i];
+                    if (luid_eq(candidate.luid, game) && candidate.outputs > 0) {
+                        present_sel = i;
+                        break;
+                    }
+                }
+            }
+
+            // Second try: any display-capable adapter that's not the neural GPU
+            if (present_sel == static_cast<size_t>(-1)) {
+                for (size_t i = 0; i < S.table.size(); ++i) {
+                    const entry &candidate = S.table[i];
+                    if (candidate.software || i == sel)
+                        continue;
+                    if (candidate.outputs > 0) {
+                        present_sel = i;
+                        break;
+                    }
+                }
+            }
+
+            // Set presentation adapter info
+            if (present_sel != static_cast<size_t>(-1)) {
+                const entry &present_e = S.table[present_sel];
+                S.result.present_luid = present_e.luid;
+                S.result.present_index = static_cast<UINT>(present_sel);
+                S.result.has_separate_present = true;
+
+                mgpu::diag::info("[MGPU][T2] GAME GPU selected");
+                
+                char line[512];
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] NEURAL GPU: adapter[%u] pci_bus=0x%02X luid=0x%08X-0x%08X",
+                         (unsigned)sel, 0x0Cu,
+                         (unsigned)e.luid.HighPart, (unsigned)e.luid.LowPart);
+                mgpu::diag::info(line);
+
+                snprintf(line, sizeof line,
+                         "[MGPU][T2] PRESENT GPU: adapter[%u] luid=0x%08X-0x%08X outputs=%u",
+                         (unsigned)present_sel,
+                         (unsigned)present_e.luid.HighPart, (unsigned)present_e.luid.LowPart,
+                         (unsigned)present_e.outputs);
+                mgpu::diag::info(line);
+
+                if (!luid_eq(e.luid, present_e.luid)) {
+                    mgpu::diag::info("[MGPU][T2] neural_adapter != presentation_adapter");
+                }
+            } else {
+                // No display-capable adapter found
+                S.result.present_luid = e.luid;
+                S.result.present_index = static_cast<UINT>(sel);
+                S.result.has_separate_present = false;
+
+                mgpu::diag::error("[MGPU][T2] ERROR: NEURAL GPU is headless with no display outputs");
+            }
+
             snprintf(line, sizeof line,
                      "[MGPU][T2] SELECTED adapter[%u] luid=0x%08X-0x%08X desc=\"%s\" outputs=%u "
                      "rule=\"%s\" | game luid=0x%08X-0x%08X (source: swapchain)",

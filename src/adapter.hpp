@@ -62,6 +62,11 @@ namespace mgpu::adapter
         // AddRef'd IDXGIAdapter1 for T3's D3D12CreateDevice; released by
         // shutdown(). nullptr when no adapter was selected.
         void *selected_adapter = nullptr;
+
+        // Presentation adapter support - separate from neural for headless configs
+        LUID present_luid{};
+        UINT present_index = 0;
+        bool has_separate_present = false;  // true if using separate presentation GPU
     };
 
     // Game thread (init_device callback). Logs the device's LUID and
