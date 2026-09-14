@@ -63,6 +63,10 @@ namespace
         LUID game_luid{};
         bool game_luid_known = false;
 
+        // T3: the T2 selection result - stored for has_separate_present,
+        // present_luid and other fields needed by create_presentation_resources()
+        adapter::selection_result result{};
+
         // T5: the present chain. Created by create_present_chain (bridge
         // thread only) and released by shutdown() in reverse creation
         // order after the GPU has been drained. The raw pointers never
@@ -74,7 +78,6 @@ namespace
         // guard for the first-failure line (brief T5: "log the first
         // Present failure and stop presenting; do not log every frame's
         // failure").
-        ID3D12CommandQueue *queue = nullptr;
         IDXGISwapChain3 *swapchain = nullptr;
         ID3D12DescriptorHeap *rtv_heap = nullptr;
         ID3D12Resource *backbuffer[2] = {};
@@ -132,6 +135,150 @@ namespace
     {
         static state s;
         return s;
+    }
+
+    bool create_presentation_resources()
+    {
+        auto &S = st();
+
+        // If we're not using separate presentation, nothing to do
+        if (!S.result.has_separate_present)
+            return true;
+
+        // Release any existing presentation resources first
+        if (S.present_device != nullptr || S.present_queue != nullptr)
+        {
+            mgpu::diag::info("[MGPU][T5] create_presentation_resources: releasing existing presentation resources");
+            release_presentation_resources();
+        }
+
+        char line[400];
+
+        // Get DXGI factory - reuse the one from create_present_chain
+        IDXGIFactory2 *factory = nullptr;
+        HRESULT hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
+                                       reinterpret_cast<void **>(&factory));
+        if (FAILED(hr))
+        {
+            mgpu::diag::error("[MGPU][T5] create_presentation_resources: CreateDXGIFactory2 failed");
+            return false;
+        }
+
+        // Find the presentation adapter by LUID
+        IDXGIAdapter1 *present_adapter = nullptr;
+        UINT i = 0;
+        while (factory->EnumAdapters1(i, &present_adapter) != DXGI_ERROR_NOT_FOUND)
+        {
+            DXGI_ADAPTER_DESC1 desc{};
+            present_adapter->GetDesc1(&desc);
+
+            // Skip software adapters
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+            {
+                mgpu::diag::info("[MGPU][T5] skipping software adapter");
+                present_adapter->Release();
+                ++i;
+                continue;
+            }
+
+            // Check if this adapter matches the presentation LUID
+            if (desc.AdapterLuid.LowPart == S.result.present_luid.LowPart &&
+                desc.AdapterLuid.HighPart == S.result.present_luid.HighPart)
+            {
+                mgpu::diag::info("[MGPU][T5] found presentation adapter matching LUID");
+                break;
+            }
+
+            present_adapter->Release();
+            ++i;
+        }
+
+        factory->Release();
+
+        if (present_adapter == nullptr)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][T5] create_presentation_resources: failed to find presentation adapter "
+                     "LUID=0x%08X-0x%08X",
+                     (unsigned)S.result.present_luid.HighPart, (unsigned)S.result.present_luid.LowPart);
+            mgpu::diag::error(line);
+            return false;
+        }
+
+        // Create D3D12 device on presentation adapter
+        ID3D12Device *present_dev = nullptr;
+        hr = D3D12CreateDevice(present_adapter, D3D_FEATURE_LEVEL_11_0,
+                              __uuidof(ID3D12Device), reinterpret_cast<void **>(&present_dev));
+        present_adapter->Release();
+
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][T5] create_presentation_resources: D3D12CreateDevice hr=0x%08X",
+                     (unsigned)hr);
+            mgpu::diag::error(line);
+            return false;
+        }
+
+        // Verify the device LUID matches
+        const LUID dev_luid = present_dev->GetAdapterLuid();
+        if (dev_luid.LowPart != S.result.present_luid.LowPart ||
+            dev_luid.HighPart != S.result.present_luid.HighPart)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][T5] create_presentation_resources: device LUID mismatch");
+            mgpu::diag::error(line);
+            present_dev->Release();
+            return false;
+        }
+
+        // Create command queue on presentation adapter
+        ID3D12CommandQueue *present_q = nullptr;
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = present_dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+                                            reinterpret_cast<void **>(&present_q));
+
+        if (FAILED(hr))
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][T5] create_presentation_resources: CreateCommandQueue hr=0x%08X",
+                     (unsigned)hr);
+            mgpu::diag::error(line);
+            present_dev->Release();
+            return false;
+        }
+
+        // Store presentation resources
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            S.present_device = present_dev;
+            S.present_queue = present_q;
+        }
+
+        snprintf(line, sizeof line,
+                 "[MGPU][T5] create_presentation_resources: PRESENT device=0x%p PRESENT queue=0x%p",
+                 (void *)present_dev, (void *)present_q);
+        mgpu::diag::info(line);
+
+        return true;
+    }
+
+    void release_presentation_resources()
+    {
+        auto &S = st();
+
+        if (S.present_queue != nullptr)
+        {
+            S.present_queue->Release();
+            S.present_queue = nullptr;
+        }
+
+        if (S.present_device != nullptr)
+        {
+            S.present_device->Release();
+            S.present_device = nullptr;
+        }
     }
 }
 
@@ -259,20 +406,37 @@ bool create_present_chain(HWND hwnd)
 
     char line[400];
 
-    // The chain is created on the T3 device - the swapchain lands on the
-    // queue's adapter (gotcha 2), so the T2/T3 binding is what makes this
-    // a GPU 1 swapchain. There is no adapter parameter anywhere to get
-    // wrong.
+    // The chain is created on a D3D12 device, and the swapchain lands on the
+    // queue's adapter (gotcha 2). When has_separate_present is true, the
+    // presentation GPU owns both the device and queue. When false, use the
+    // neural T3 device as before.
     ID3D12Device *dev = nullptr;
+    ID3D12CommandQueue *queue_for_swapchain = nullptr;
+
+    if (S.result.has_separate_present)
     {
-        std::lock_guard<std::mutex> lk(S.cs);
-        if (S.device == nullptr)
+        mgpu::diag::info("[MGPU][T5] separate presentation path active");
+
+        // Initialize the presentation GPU's device and queue before creating swapchain
+        const bool init_ok = create_presentation_resources();
+        if (!init_ok)
         {
-            mgpu::diag::error("[MGPU][T5] create_present_chain: no device - refusing (the chain is "
-                              "created on the T3 device; there is no fallback path)");
+            mgpu::diag::error("[MGPU][T5] create_present_chain: create_presentation_resources failed");
             return false;
         }
-        dev = S.device;
+
+        std::lock_guard<std::mutex> lk(S.cs);
+        dev = S.present_device;
+        queue_for_swapchain = S.present_queue;
+
+        if (dev == nullptr || queue_for_swapchain == nullptr)
+        {
+            mgpu::diag::error("[MGPU][T5] create_present_chain: presentation device/queue not available");
+            return false;
+        }
+
+        mgpu::diag::info("[MGPU][T5] PRESENT device=0x%p PRESENT queue=0x%p",
+                         (void *)dev, (void *)queue_for_swapchain);
     }
 
     // Query the window's client rect itself (brief T5). The T5 window is
@@ -291,7 +455,9 @@ bool create_present_chain(HWND hwnd)
     const UINT width = static_cast<UINT>(rc.right - rc.left);
     const UINT height = static_cast<UINT>(rc.bottom - rc.top);
 
-    ID3D12CommandQueue *queue = nullptr;
+    // When has_separate_present is true, queue_for_swapchain was set to
+    // S.present_queue above. Otherwise use the local T3 device's queue.
+    ID3D12CommandQueue *queue = queue_for_swapchain;
     IDXGIFactory2 *factory = nullptr;
     IDXGISwapChain1 *sc1 = nullptr;
     IDXGISwapChain3 *sc3 = nullptr;
@@ -341,17 +507,28 @@ bool create_present_chain(HWND hwnd)
         return false;
     };
 
-    // 1. Command queue (DIRECT). The swapchain created against it lands
-    // on this queue's adapter - the T3 device's adapter (GPU 1).
+    // When separate presentation is disabled (has_separate_present == false),
+    // create a local command queue from the T3 device and publish it to S.queue.
+    if (!S.result.has_separate_present)
     {
+        ID3D12CommandQueue *local_queue = nullptr;
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         qd.Priority = 0;
         qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
         qd.NodeMask = 0;
-        const HRESULT hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
+        const HRESULT hr = dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&local_queue));
         if (FAILED(hr))
             return fail("CreateCommandQueue", hr);
+
+        // Publish the local queue to S.queue under lock
+        {
+            std::lock_guard<std::mutex> lk(S.cs);
+            S.queue = local_queue;
+        }
+
+        // For the non-separate-present case, queue_for_swapchain is the T3 device's local queue
+        queue_for_swapchain = local_queue;
     }
 
     // 2. The swapchain, against the window.
@@ -397,7 +574,7 @@ bool create_present_chain(HWND hwnd)
         // the device compiles, runs, and fails at runtime with an
         // unhelpful E_INVALIDARG.
         swapchain_hr = factory->CreateSwapChainForHwnd(
-            static_cast<IUnknown *>(queue), hwnd, &scd, nullptr, nullptr, &sc1);
+            static_cast<IUnknown *>(queue_for_swapchain), hwnd, &scd, nullptr, nullptr, &sc1);
         if (FAILED(swapchain_hr))
             return fail("CreateSwapChainForHwnd", swapchain_hr);
 
@@ -507,7 +684,8 @@ bool create_present_chain(HWND hwnd)
     // HRESULT of CreateSwapChainForHwnd (brief T5 "Logging").
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        S.queue = queue;
+        // When separate presentation is enabled, S.queue remains nullptr
+        // because we use the PRESENT GPU's queue for the swapchain
         S.hwnd = hwnd;
         S.chain_w = width;
         S.chain_h = height;
@@ -527,7 +705,8 @@ bool create_present_chain(HWND hwnd)
         S.fence_value = 0;
         S.present_failed_logged = false;
         // The state owns them now; the locals must not release them twice.
-        queue = nullptr;
+        // queue_for_swapchain is owned by S (either S.queue or S.present_queue)
+        // so we don't reset it here
         sc3 = nullptr;
         heap = nullptr;
         back0 = nullptr;
@@ -1098,7 +1277,12 @@ void shutdown()
     UINT64 fence_value = 0;
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        queue = S.queue;
+        // When has_separate_present is true, the swapchain uses S.present_queue.
+        // Otherwise it uses S.queue (the T3 device's local queue).
+        if (S.result.has_separate_present)
+            queue = S.present_queue;
+        else
+            queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
         backbuffer[0] = S.backbuffer[0];
@@ -1114,7 +1298,13 @@ void shutdown()
         fence = S.fence;
         event = S.fence_event;
         fence_value = S.fence_value;
-        S.queue = nullptr;
+        // Only clear the queue that was actually used. When has_separate_present
+        // is true, S.present_queue holds the swapchain's queue. Otherwise,
+        // S.queue holds it. The other remains nullptr.
+        if (S.result.has_separate_present)
+            S.present_queue = nullptr;
+        else
+            S.queue = nullptr;
         S.swapchain = nullptr;
         S.rtv_heap = nullptr;
         S.backbuffer[0] = nullptr;
@@ -1174,10 +1364,15 @@ void shutdown()
         heap->Release();
         sc->Release();
         queue->Release();
-        mgpu::diag::info("[MGPU][T5] present chain released (GPU drained, reverse creation order)");
-    }
+         mgpu::diag::info("[MGPU][T5] present chain released (GPU drained, reverse creation order)");
+     }
 
-    // The device, as T3 did it - last: everything that references it
+     // Release the presentation resources (S.present_device, S.present_queue)
+     // after the chain is gone but before the device.
+     if (S.result.has_separate_present)
+         release_presentation_resources();
+
+     // The device, as T3 did it - last: everything that references it
     // (the chain, above) is gone by now.
     {
         std::lock_guard<std::mutex> lk(S.cs);
