@@ -378,7 +378,7 @@ bool create_present_chain(HWND hwnd)
         // the only route. The game renders R10G10B10A2 (DXGI 24) and P3.1
         // established NR consumes and produces it unconverted, so the whole
         // chain is now one format end to end.
-        scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        scd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
