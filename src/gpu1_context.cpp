@@ -122,6 +122,10 @@ namespace
         DXGI_FORMAT chain_fmt = DXGI_FORMAT_UNKNOWN;
         bool borderless = false;
         bool sized_to_source = false;   // one resize per stream, not per frame
+
+        // Presentation adapter support when has_separate_present is true
+        ID3D12Device *present_device = nullptr;
+        ID3D12CommandQueue *present_queue = nullptr;
     };
 
     state &st()

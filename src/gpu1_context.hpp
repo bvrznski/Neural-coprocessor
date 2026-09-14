@@ -19,6 +19,14 @@ namespace mgpu::gpu1
     // fallback to the game's adapter.
     bool create_device(const adapter::selection_result &sel);
 
+    // Bridge thread only. Creates presentation resources (device/queue) on
+    // the presentation adapter when has_separate_present is true.
+    // Returns false and releases any created resources on failure.
+    bool create_presentation_resources();
+    
+    // Bridge thread only. Releases all presentation resources.
+    void release_presentation_resources();
+
     // Bridge thread only. Releases the device if one exists.
     //
     // T5 (extension, not replacement): first releases the present chain
