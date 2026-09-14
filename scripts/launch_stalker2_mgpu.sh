@@ -4,7 +4,7 @@
 set -euo pipefail
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
-    echo "Usage: $0 --game-pci DOMAIN:BUS:DEVICE.FUNCTION [--dry-run]"
+    echo "Usage: $0 --game-pci DOMAIN:BUS:DEVICE.FUNCTION [--profile native|native-upscale] [--dry-run]"
     echo 'Supply the verified GAME/RENDER PCI address; NVIDIA indices are not accepted.'
     echo 'Keep Steam game Launch Options: PROTON_LOG=1 %command%'
 }
@@ -16,12 +16,18 @@ normalize() {
 }
 game=''
 dry_run=false
+profile=''
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
     case $1 in
         --game-pci)
             (($# >= 2)) || die '--game-pci needs an address'
             game=$(normalize "$2"); shift 2 ;;
         --dry-run) dry_run=true; shift ;;
+        --profile)
+            (($# >= 2)) || die '--profile needs a name'
+            case $2 in native|native-upscale) profile=$2 ;; *) die "Unknown profile: $2" ;; esac
+            shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown argument: $1" ;;
     esac
@@ -66,6 +72,20 @@ printf 'NEURAL GPU  : PCI %s / index %s\n' "$neural" "${indices[$neural]}"
 printf 'PRESENT GPU : PCI %s / index %s\n' "$present" "${indices[$present]}"
 printf 'TARGET      : ASUS (existing display configuration)\nPOWER LIMIT : 350 W\n'
 echo 'Steam Launch Options must retain PROTON_LOG=1 %command%, including when Steam is already running.'
+if [[ -n $profile ]]; then
+    command -v python3 >/dev/null || die 'python3 is required for MGPU profiles'
+    # Refuse a live INI edit; Steam may otherwise reuse the running game.
+    command -v pgrep >/dev/null || die 'pgrep is required to check for a running game'
+    if pgrep -fi '[S]talker2-Win64' >/dev/null; then
+        die 'Close STALKER 2 before selecting an MGPU profile'
+    else
+        rc=$?
+        [[ $rc == 1 ]] || die 'Cannot check whether STALKER 2 is running'
+    fi
+    profile_args=(--ini "$game_dir/Stalker2/Binaries/Win64/mgpu.ini" --profile "$profile")
+    python3 "$script_dir/mgpu_profile.py" "${profile_args[@]}" --preview ||
+        die 'MGPU profile validation failed'
+fi
 if $dry_run; then
     printf 'Would set 350 W on PCI %s\n' "${participants[@]}"
     echo 'Would request Flatpak Steam launch of AppID 1643320. No changes made.'
@@ -88,6 +108,9 @@ for pci in "${participants[@]}"; do
 done
 "$smi" --query-gpu=index,pci.bus_id,name,power.limit,power.max_limit --format=csv ||
     die 'Final GPU report failed; not launching'
+if [[ -n $profile ]]; then
+    python3 "$script_dir/mgpu_profile.py" "${profile_args[@]}" || die 'MGPU profile update failed'
+fi
 # Existing per-game Launch Options remain authoritative for an already running Steam.
 # No shader processing, cache changes, bridge controls, or automatic power reset.
 exec flatpak run --env=PROTON_LOG=1 com.valvesoftware.Steam -applaunch 1643320

@@ -1,5 +1,47 @@
 # Controlled STALKER 2 launcher
 
+## Optional MGPU optimization profiles (2026-09-14)
+
+Append `--profile native-upscale` to reduce the neural processing resolution to
+the game's own render extent, followed by bridge SR. This uses the existing
+`SRUpscale=1`, `SRScale=0`, `SRMvLowRes=0` path documented and implemented in
+`src/dllmain.cpp`. The game must already use upscaling; at native/DLAA resolution
+this does not provide the intended saving and the bridge may decline SR.
+Image quality and frametime require in-game comparison; no measured FPS gain
+is claimed on this four-3090 machine. The upstream architecture and measurements
+are described at https://github.com/maohgad-web/Neural-coprocessor .
+
+`--profile native` keeps full-resolution neural rendering (`SRUpscale=0`). Both
+profiles select one neural pass, coherent ring transport, no frame stride and
+disabled diagnostic probes/profiling. Most of these common settings already
+match the installed configuration; their presence is not a new performance gain.
+Intensity, monitor selection, transport calibration, crash flags and auto-arm
+are preserved. No new DLL or Vulkan layer is introduced.
+
+No profile is applied by default. Use `--dry-run` with a profile to preview
+without changing files or GPU power. Applying creates an exact-byte
+`mgpu.ini.backup-*` alongside the INI and atomically replaces only the relevant
+settings. Duplicate relevant keys/sections and unsupported encodings abort.
+The launcher refuses profile selection while STALKER 2 is running. Close the
+game before using the standalone helper too. Restore the printed backup over
+`mgpu.ini` with the game closed for an exact rollback; `native` is a preset,
+not a restoration of all previous settings.
+
+Example (replace the address with the verified GAME PCI):
+
+```bash
+scripts/launch_stalker2_mgpu.sh --game-pci 0000:43:00.0 --profile native-upscale --dry-run
+```
+
+Validation: Bash syntax and ShellCheck; seven Python unit tests covering SR
+pairing, unrelated state, native mode, CRLF/BOM/comments, malformed/ambiguous
+input, idempotence, read-only preview, backup/restore and symlink rejection.
+Three additional mocked launcher checks passed: profile preview, refusal when
+the game is running, and refusal when process inspection fails. The installed
+INI remained byte-identical. The installed INI was previewed only. No game launch, GPU power change or live
+profile application is part of this validation. Uncommitted presentation-path
+work in `src/gpu1_context.cpp` is outside this change and remains unvalidated.
+
 Run `scripts/launch_stalker2_mgpu.sh --game-pci <verified-render-PCI>` from
 your desktop account. Add `--dry-run` to inspect the mapping without changing
 power or starting Steam. Four-digit and eight-digit zero domains are accepted.
